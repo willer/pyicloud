@@ -1,5 +1,9 @@
 """Drive service tests."""
 from unittest import TestCase
+from pyicloud.services.drive import DriveService
+from datetime import datetime
+import mock
+import os
 
 import pytest
 
@@ -14,7 +18,12 @@ class DriveServiceTest(TestCase):
 
     def setUp(self):
         """Set up tests."""
-        self.service = PyiCloudServiceMock(AUTHENTICATED_USER, VALID_PASSWORD)
+        self.service = DriveService(
+            service_root="https://p##-drive.icloud.com",
+            document_root="https://p##-docws.icloud.com/ws",
+            session="session",
+            params="params"
+        )
 
     def test_root(self):
         """Test the root folder."""
