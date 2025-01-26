@@ -46,6 +46,16 @@ def test_contacts_service():
     try:
         contacts = api.contacts.all()
         assert contacts is not None, "Contacts list is None"
+        assert len(contacts) > 0, "No contacts found - expected at least one contact"
         print(f"Found {len(contacts)} contacts")
+        
+        # Verify first contact has basic required fields
+        first_contact = contacts[0]
+        assert 'firstName' in first_contact or 'lastName' in first_contact, \
+            "First contact missing name fields"
+            
+        # Print some basic info about the first contact
+        print(f"First contact: {first_contact.get('firstName', '')} {first_contact.get('lastName', '')}")
+        
     except Exception as e:
         pytest.fail(f"Failed to access contacts: {str(e)}") 
