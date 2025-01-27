@@ -19,6 +19,27 @@ class CalendarService:
         self._calendar_event_detail_url = f"{self._calendar_endpoint}/eventdetail"
         self._calendars = "%s/startup" % self._calendar_endpoint
 
+        # Add service-specific headers
+        self.session.headers.update({
+            "Origin": "https://www.icloud.com",
+            "Referer": "https://www.icloud.com/calendar/",
+            "Accept": "*/*",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Apple-Service": "calendar",
+            "X-Apple-Auth-Token": session.service.session_data.get("session_token"),
+            "X-Apple-Domain-Id": "calendar",
+        })
+
+        # Add service-specific parameters
+        self.params.update({
+            "clientBuildNumber": "2020Project52",
+            "clientMasteringNumber": "2020B29",
+            "clientId": session.service.client_id,
+            "dsid": session.service.data.get("dsInfo", {}).get("dsid"),
+            "lang": "en-us",
+            "usertz": get_localzone_name(),
+        })
+
         self.response = {}
 
     def get_event_detail(self, pguid, guid):

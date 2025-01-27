@@ -52,28 +52,30 @@ def test_reminders_service():
     
     # Test listing reminder lists
     try:
-        lists = reminders.lists()
+        lists = reminders.lists
         assert lists is not None, "Reminder lists is None"
         print(f"Found {len(lists)} reminder lists")
         
-        for lst in lists:
-            print(f"List: {lst.title}")
+        for title, lst in lists.items():
+            print(f"List: {title}")
+            for reminder in lst:
+                print(f"  - {reminder['title']}")
     except Exception as e:
         pytest.fail(f"Failed to get reminder lists: {str(e)}")
     
     # Test accessing reminders in first list
     if lists:
-        first_list = lists[0]
+        first_list_title = next(iter(lists.keys()))
+        first_list = lists[first_list_title]
         try:
-            print(f"Accessing reminders in list: {first_list.title}")
-            reminders_in_list = first_list.reminders()
-            assert reminders_in_list is not None, "Reminders in list is None"
+            print(f"Accessing reminders in list: {first_list_title}")
+            assert first_list is not None, "Reminders in list is None"
             
             # Print some details about the reminders
-            for reminder in reminders_in_list:
-                print(f"Reminder: {reminder.title}")
-                print(f"  Completed: {reminder.completed}")
-                print(f"  Due Date: {reminder.due_date}")
+            for reminder in first_list:
+                print(f"Reminder: {reminder['title']}")
+                print(f"  Description: {reminder.get('desc', 'No description')}")
+                print(f"  Due Date: {reminder.get('due', 'No due date')}")
         except Exception as e:
             pytest.fail(f"Failed to access reminders in list: {str(e)}")
 
@@ -87,22 +89,32 @@ def test_reminder_creation():
     
     api = PyiCloudService(username, password)
     reminders = api.reminders
-    lists = reminders.lists()
+    lists = reminders.lists
     
     if not lists:
         pytest.skip("No reminder lists available")
     
     try:
         # Try to create a test reminder
-        test_list = lists[0]
-        new_reminder = test_list.create_reminder(
+        first_list_title = next(iter(lists.keys()))
+        success = reminders.post(
             "PyiCloud Test Reminder",
-            description="This is a test reminder created by PyiCloud"
+            description="This is a test reminder created by PyiCloud",
+            collection=first_list_title
         )
-        assert new_reminder is not None, "Failed to create reminder"
-        print(f"Created reminder: {new_reminder.title}")
+        assert success, "Failed to create reminder"
+        print(f"Created reminder in list: {first_list_title}")
         
-        # Clean up - delete the test reminder
-        new_reminder.delete()
+        # Refresh to see the new reminder
+        reminders.refresh()
+        
+        # Verify the reminder was created
+        new_list = reminders.lists[first_list_title]
+        found = False
+        for reminder in new_list:
+            if reminder['title'] == "PyiCloud Test Reminder":
+                found = True
+                break
+        assert found, "Could not find newly created reminder"
     except Exception as e:
-        pytest.fail(f"Failed to create/delete reminder: {str(e)}") 
+        pytest.fail(f"Failed to create/verify reminder: {str(e)}") 

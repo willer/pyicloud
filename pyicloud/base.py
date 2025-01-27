@@ -103,16 +103,23 @@ class PyiCloudSession(Session):
             try:
                 # pylint: disable=protected-access
                 fmip_url = self.service._get_webservice_url("findme")
+                calendar_url = self.service._get_webservice_url("calendar")
+                reminders_url = self.service._get_webservice_url("reminders")
+                
                 if (
                     has_retried is None
                     and response.status_code in [421, 450, 500]
-                    and fmip_url in url
+                    and (fmip_url in url or calendar_url in url or reminders_url in url)
                 ):
-                    # Handle re-authentication for Find My iPhone
-                    LOGGER.debug("Re-authenticating Find My iPhone service")
+                    # Handle re-authentication for Find My iPhone, Calendar, and Reminders
+                    LOGGER.debug("Re-authenticating service")
                     try:
                         # If 450, authentication requires a full sign in to the account
                         service = None if response.status_code == 450 else "find"
+                        if calendar_url in url:
+                            service = "calendar"
+                        elif reminders_url in url:
+                            service = "reminders"
                         self.service.authenticate(True, service)
 
                     except PyiCloudAPIResponseException:
@@ -370,7 +377,17 @@ class PyiCloudService:
             "appName": service,
             "apple_id": self.user["accountName"],
             "password": self.user["password"],
+            "extended_login": True,
         }
+
+        # Add service-specific parameters
+        if service in ["calendar", "reminders"]:
+            data.update({
+                "clientBuildNumber": "2020Project52",
+                "clientMasteringNumber": "2020B29",
+                "clientId": self.client_id,
+                "dsid": self.data.get("dsInfo", {}).get("dsid"),
+            })
 
         try:
             self.session.post(
