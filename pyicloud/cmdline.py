@@ -6,12 +6,16 @@ command line scripts, and related.
 import argparse
 import pickle
 import sys
-
+import os
 from click import confirm
+from dotenv import load_dotenv
 
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import PyiCloudFailedLoginException
 from . import utils
+
+# Load environment variables from .env file
+load_dotenv()
 
 DEVICE_ERROR = "Please use the --device switch to indicate which device to use."
 
@@ -39,17 +43,17 @@ def main(args=None):
         "--username",
         action="store",
         dest="username",
-        default="",
-        help="Apple ID to Use",
+        default=os.environ.get("ICLOUD_USERNAME", ""),
+        help="Apple ID to Use (can also be set via ICLOUD_USERNAME env var)",
     )
     parser.add_argument(
         "--password",
         action="store",
         dest="password",
-        default="",
+        default=os.environ.get("ICLOUD_PASSWORD", ""),
         help=(
-            "Apple ID Password to Use; if unspecified, password will be "
-            "fetched from the system keyring."
+            "Apple ID Password to Use (can also be set via ICLOUD_PASSWORD env var); "
+            "if unspecified, password will be fetched from the system keyring."
         ),
     )
     parser.add_argument(

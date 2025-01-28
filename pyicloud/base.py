@@ -555,6 +555,7 @@ class PyiCloudService:
 
     def _get_webservice_url(self, ws_key):
         """Get webservice URL, raise an exception if not exists."""
+        LOGGER.debug("Getting webservice URL for %s", ws_key)
         if self._webservices.get(ws_key) is None:
             raise PyiCloudServiceNotActivatedException(
                 "Webservice not available", ws_key
@@ -611,7 +612,9 @@ class PyiCloudService:
     @property
     def reminders(self):
         """Gets the 'Reminders' service."""
+        LOGGER.debug("Initializing reminders service")
         service_root = self._get_webservice_url("reminders")
+        LOGGER.debug("Got reminders service root: %s", service_root)
         return RemindersService(service_root, self.session, self.params)
 
     @property

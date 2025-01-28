@@ -125,3 +125,136 @@ When making changes:
 2. Update the "What Hasn't Worked" section if trying new methods
 3. Keep track of successful changes in "What Has Worked"
 4. Add any new debug tips or known issues
+
+# Development Notes
+
+## Running Tests
+
+### Integration Tests
+To run the integration tests for the reminders service:
+```bash
+python -m pytest tests_integration/test_reminders_integration.py -v -s
+```
+
+Requirements:
+1. Set up environment variables:
+   - `ICLOUD_USERNAME`: Your iCloud account email
+   - `ICLOUD_PASSWORD`: Your iCloud account password
+2. Be prepared to handle 2FA if required
+3. Have an active iCloud account with reminders enabled
+
+### Test Structure
+The reminders integration tests verify:
+1. Basic service functionality (listing reminders and collections)
+2. List management (create, update, get lists)
+3. Reminder lifecycle (create, update, verify attributes)
+4. Priority levels and tags
+5. Due dates and descriptions
+
+Note: Reminder completion is not tested as it's not supported by the web API.
+
+## Reminders Service
+
+The reminders service provides access to iCloud reminders through the web API. Here are the supported features and limitations:
+
+## Supported Features
+
+### List Management
+- Listing all reminder lists
+- Creating new reminder lists
+- Updating list titles and colors
+- Retrieving list details by GUID
+
+### Reminder Management
+- Creating new reminders
+- Updating existing reminders
+- Setting and updating reminder titles and descriptions
+- Setting and updating due dates
+- Setting and updating priority levels (0-4)
+  - 0: None
+  - 1: Low
+  - 2: Medium
+  - 3: High
+  - 4: Urgent
+- Adding and updating tags for reminders
+- Organizing reminders into lists
+
+## Limitations
+
+### Completion Status
+- The iCloud web API does not support completing reminders
+- Reminder completion is only available through native iOS/macOS apps
+- The `complete()` method will always return `False`
+
+### Other Limitations
+- No support for recurring reminders through the web API
+- No support for reminder alarms/notifications
+- No support for deleting reminders or lists
+- No support for subtasks/nested tasks
+- No support for sharing reminders with family members
+
+## Authentication
+
+The reminders service requires proper authentication with iCloud. The service will:
+1. Re-authenticate when necessary
+2. Use appropriate headers for the reminders service
+3. Maintain session cookies and tokens
+
+## API Format
+
+### Creating/Updating Lists
+Lists are managed through the `/rd/collections` endpoint with the following data format:
+```json
+{
+    "Collection": {
+        "title": "List Title",
+        "guid": "unique-guid",
+        "ctag": null,
+        "color": null,
+        "order": null,
+        "symbolicColor": null,
+        "lastModifiedDate": "ISO-8601-date",
+        "createdDate": "ISO-8601-date"
+    }
+}
+```
+
+### Creating/Updating Reminders
+Reminders are managed through the `/rd/reminders/tasks` endpoint with the following data format:
+```json
+{
+    "Reminder": {
+        "title": "Reminder Title",
+        "description": "Description",
+        "guid": "unique-guid",
+        "pGuid": "parent-list-guid",
+        "etag": null,
+        "order": null,
+        "priority": 0,
+        "tags": ["tag1", "tag2"],
+        "recurrence": null,
+        "alarms": [],
+        "createdDate": "ISO-8601-date",
+        "lastModifiedDate": "ISO-8601-date",
+        "dueDateIsAllDay": false,
+        "completed": false,
+        "completedDate": null
+    }
+}
+```
+
+## Best Practices
+
+1. Always refresh the cache after creating or updating reminders/lists
+2. Use appropriate error handling for API requests
+3. Verify list existence before creating reminders in a list
+4. Use ISO-8601 format for dates
+5. Keep priority levels between 0-4
+6. Use meaningful tags for better organization
+
+## Authentication
+
+The iCloud web API requires proper authentication for each service. For reminders, this includes:
+- Re-authenticating with `authenticate(True, "reminders")` before making requests
+- Including the `X-Apple-Auth-Token` header from cookies
+- Setting the correct service headers (`X-Apple-Service`, `X-Apple-Domain-Id`)
