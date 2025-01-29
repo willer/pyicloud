@@ -258,3 +258,93 @@ The iCloud web API requires proper authentication for each service. For reminder
 - Re-authenticating with `authenticate(True, "reminders")` before making requests
 - Including the `X-Apple-Auth-Token` header from cookies
 - Setting the correct service headers (`X-Apple-Service`, `X-Apple-Domain-Id`)
+
+# Reminders Service Debugging Notes
+
+## Current Issues
+1. Authentication failures with 503 errors
+2. Tests timing out due to long execution times
+3. System incorrectly reporting "no lists" despite lists being present in output
+
+## Attempted Solutions
+1. Added authentication retry logic with exponential backoff
+   - Result: Still seeing 503 errors and auth failures
+   - Possible issue: Backoff timing may need adjustment
+
+2. Modified update method to verify changes
+   - Result: Update verification failing
+   - Possible issue: Race condition between update and verification
+
+3. Added service-specific parameters from calendar service
+   - Result: Partially successful - can list reminders but updates fail
+   - Note: May need additional parameters for update operations
+
+## Failed Approaches
+1. Simple retry mechanism without backoff
+   - Why it failed: Rate limiting from iCloud service
+   - Lesson: Need smarter retry strategy
+
+2. Direct parameter copying from calendar service
+   - Why it failed: Reminders service needs some unique parameters
+   - Lesson: Need to understand service-specific requirements
+
+## Current Hypotheses
+1. Authentication token expiration
+   - The service may be invalidating tokens more aggressively than expected
+   - Need to implement token refresh before each operation
+
+2. Race conditions
+   - Server may need more time to process updates
+   - Consider implementing consistent wait times between operations
+
+3. Missing parameters
+   - Update operations may require additional headers/parameters
+   - Need to capture and compare successful vs failed requests
+
+## Next Steps
+1. Implement token refresh before each operation
+2. Add consistent wait times between operations
+3. Review successful calendar service operations to identify missing parameters
+4. Consider implementing request/response logging for debugging
+5. Optimize test execution time by reducing retry attempts for known failure cases
+
+## Performance Issues
+1. Tests taking too long
+   - Current timeout: None specified
+   - Retry delays compound the issue
+   - Need to optimize retry strategy and add timeouts
+
+## Questions to Investigate
+1. Why does list retrieval work but updates fail?
+2. Are we handling rate limiting correctly?
+3. Is there a difference in how the web interface handles these operations?
+4. What's the minimum set of parameters needed for each operation type?
+
+## New Approach (2024-03-25)
+
+### Authentication Improvements
+1. Implement pre-request token refresh
+2. Add service-specific token expiration tracking
+3. Separate auth flows for reminders vs other services
+
+### Performance Optimizations
+1. Add controlled concurrency with ThreadPoolExecutor
+2. Implement jittered backoff for retries
+3. Add rate limiting between batch operations
+
+### Validation Added
+1. Collection existence checks before operations
+2. Timezone-aware date handling
+3. Default collection fallback
+
+## Expected Results
+1. test_reminder_lifecycle: Fix 500 errors with fresh tokens
+2. test_large_list_performance: Reduce time from 165s to <30s
+3. test_chief_of_staff_operations: Fix date comparison issues
+4. test_reminder_error_cases: Proper collection fallback
+
+## Verification Plan
+1. Run tests with `--log-cli-level=DEBUG` to monitor auth flows
+2. Check response times in performance test
+3. Verify UTC dates in network traces
+4. Test invalid collection handling

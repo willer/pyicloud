@@ -9,6 +9,8 @@ from os import path, mkdir
 from re import match
 import http.cookiejar as cookielib
 import getpass
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -61,10 +63,22 @@ class PyiCloudSession(Session):
     def __init__(self, service):
         self.service = service
         super().__init__()
+        # Configure minimal retry strategy - only for network errors
+        self.retry_strategy = Retry(
+            total=2,  # Reduced from 5
+            connect=2,  # Only retry on connection errors
+            read=2,    # Only retry on read errors
+            backoff_factor=1,
+            status_forcelist=[429, 503],  # Remove 500s, only retry on rate limits and temp unavailable
+            allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
+            respect_retry_after_header=True,
+            raise_on_status=True  # Let the service handle HTTP errors
+        )
+        self.mount('https://', HTTPAdapter(max_retries=self.retry_strategy))
 
-    def request(self, method, url, **kwargs):  # pylint: disable=arguments-differ
-
-        # Charge logging to the right service endpoint
+    def request(self, method, url, **kwargs):
+        """Make a request with improved logging and error handling."""
+        # Set up logging
         callee = inspect.stack()[2]
         module = inspect.getmodule(callee[0])
         request_logger = logging.getLogger(module.__name__).getChild("http")
@@ -73,13 +87,14 @@ class PyiCloudSession(Session):
 
         request_logger.debug("%s %s %s", method, url, kwargs.get("data", ""))
 
-        has_retried = kwargs.get("retried")
-        kwargs.pop("retried", None)
+        # Make request
         response = super().request(method, url, **kwargs)
 
+        # Handle response
         content_type = response.headers.get("Content-Type", "").split(";")[0]
         json_mimetypes = ["application/json", "text/json"]
 
+        # Update session data from headers
         for header, value in HEADER_DATA.items():
             if response.headers.get(header):
                 session_arg = value
@@ -87,84 +102,31 @@ class PyiCloudSession(Session):
                     {session_arg: response.headers.get(header)}
                 )
 
-        # Save session_data to file
+        # Save session data
         with open(self.service.session_path, "w", encoding="utf-8") as outfile:
             json.dump(self.service.session_data, outfile)
-            LOGGER.debug("Saved session data to file")
+            request_logger.debug("Saved session data to file")
 
-        # Save cookies to file
+        # Save cookies
         self.cookies.save(ignore_discard=True, ignore_expires=True)
-        LOGGER.debug("Cookies saved to %s", self.service.cookiejar_path)
+        request_logger.debug("Cookies saved to %s", self.service.cookiejar_path)
 
+        # Handle error responses
         if not response.ok and (
             content_type not in json_mimetypes
             or response.status_code in [421, 450, 500]
         ):
-            try:
-                # pylint: disable=protected-access
-                fmip_url = self.service._get_webservice_url("findme")
-                calendar_url = self.service._get_webservice_url("calendar")
-                reminders_url = self.service._get_webservice_url("reminders")
-                
-                if (
-                    has_retried is None
-                    and response.status_code in [421, 450, 500]
-                    and (fmip_url in url or calendar_url in url or reminders_url in url)
-                ):
-                    # Handle re-authentication for Find My iPhone, Calendar, and Reminders
-                    LOGGER.debug("Re-authenticating service")
-                    try:
-                        # If 450, authentication requires a full sign in to the account
-                        service = None if response.status_code == 450 else "find"
-                        if calendar_url in url:
-                            service = "calendar"
-                        elif reminders_url in url:
-                            service = "reminders"
-                        self.service.authenticate(True, service)
-
-                    except PyiCloudAPIResponseException:
-                        LOGGER.debug("Re-authentication failed")
-                    kwargs["retried"] = True
-                    return self.request(method, url, **kwargs)
-            except Exception:
-                pass
-
-            if has_retried is None and response.status_code in [421, 450, 500]:
-                api_error = PyiCloudAPIResponseException(
-                    response.reason, response.status_code, retry=True
+            # Let individual services handle retries for auth/service errors
+            if response.status_code in [421, 450, 500]:
+                request_logger.warning(
+                    "Got status %d: %s", 
+                    response.status_code,
+                    response.text if response.text else "No error message"
                 )
-                request_logger.debug(api_error)
-                kwargs["retried"] = True
-                return self.request(method, url, **kwargs)
-
+                self._raise_error(response.status_code, response.reason)
+            
+            # Only retry network errors (handled by urllib3)
             self._raise_error(response.status_code, response.reason)
-
-        if content_type not in json_mimetypes:
-            return response
-
-        try:
-            data = response.json()
-        except:  # pylint: disable=bare-except
-            request_logger.warning("Failed to parse response with JSON mimetype")
-            return response
-
-        request_logger.debug(data)
-
-        if isinstance(data, dict):
-            reason = data.get("errorMessage")
-            reason = reason or data.get("reason")
-            reason = reason or data.get("errorReason")
-            if not reason and isinstance(data.get("error"), str):
-                reason = data.get("error")
-            if not reason and data.get("error"):
-                reason = "Unknown reason"
-
-            code = data.get("errorCode")
-            if not code and data.get("serverErrorCode"):
-                code = data.get("serverErrorCode")
-
-            if reason:
-                self._raise_error(code, reason)
 
         return response
 
