@@ -29,41 +29,49 @@ class FindMyiPhoneServiceManager:
         """Refreshes the FindMyiPhoneService endpoint,
 
         This ensures that the location data is up-to-date.
-
         """
-        req = self.session.post(
-            self._fmip_refresh_url,
-            params=self.params,
-            data=json.dumps(
-                {
-                    "clientContext": {
-                        "fmly": self.with_family,
-                        "shouldLocate": True,
-                        "selectedDevice": "all",
-                        "deviceListVersion": 1,
+        try:
+            req = self.session.post(
+                self._fmip_refresh_url,
+                params=self.params,
+                data=json.dumps(
+                    {
+                        "clientContext": {
+                            "fmly": self.with_family,
+                            "shouldLocate": True,
+                            "selectedDevice": "all",
+                            "deviceListVersion": 1,
+                        }
                     }
-                }
-            ),
-        )
-        self.response = req.json()
+                ),
+            )
+            self.response = req.json()
 
-        for device_info in self.response["content"]:
-            device_id = device_info["id"]
-            if device_id not in self._devices:
-                self._devices[device_id] = AppleDevice(
-                    device_info,
-                    self.session,
-                    self.params,
-                    manager=self,
-                    sound_url=self._fmip_sound_url,
-                    lost_url=self._fmip_lost_url,
-                    message_url=self._fmip_message_url,
-                )
-            else:
-                self._devices[device_id].update(device_info)
+            for device_info in self.response["content"]:
+                device_id = device_info["id"]
+                if device_id not in self._devices:
+                    self._devices[device_id] = AppleDevice(
+                        device_info,
+                        self.session,
+                        self.params,
+                        manager=self,
+                        sound_url=self._fmip_sound_url,
+                        lost_url=self._fmip_lost_url,
+                        message_url=self._fmip_message_url,
+                    )
+                else:
+                    self._devices[device_id].update(device_info)
 
-        if not self._devices:
-            raise PyiCloudNoDevicesException()
+            if not self._devices:
+                raise PyiCloudNoDevicesException()
+
+        except Exception as e:
+            # If we get an authentication error, try to re-authenticate
+            if hasattr(e, 'response') and e.response.status_code in (450, 500):
+                self.session.service.authenticate(force_refresh=True)
+                # Retry the request after re-authentication
+                return self.refresh_client()
+            raise
 
     def __getitem__(self, key):
         if isinstance(key, int):

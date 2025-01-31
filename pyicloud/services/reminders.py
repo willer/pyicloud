@@ -63,17 +63,20 @@ class RemindersService:
         self.refresh()
 
     def _authenticate_before_request(self):
-        """Refresh auth token if needed before making requests"""
-        if time.time() > self.token_expiry - 60:  # Refresh 60s before expiry
+        """Refresh auth token before each request"""
+        try:
             self.session.service.authenticate(True, "reminders")
-            # Set new expiration time (assuming 30min validity)
-            self.token_expiry = time.time() + 1800
-            # Update session cookies
-            self.session.cookies = self.session.service.session.cookies
             LOGGER.debug("Refreshed reminders service auth token")
+        except Exception as e:
+            LOGGER.error("Failed to refresh auth token: %s", str(e))
+            return False
+        return True
 
     def _make_request(self, method, endpoint, data=None, params=None, retries=None):
         """Make an authenticated request to the reminders service."""
+        if not self._authenticate_before_request():
+            return None
+        
         if retries is None:
             retries = self._max_retries
             
@@ -440,10 +443,16 @@ class RemindersService:
             collection=target_collection
         )
 
-    def get_reminders_by_due_date(self, start_date: Optional[datetime] = None, 
+    def get_reminders_by_due_date(self, start_date: Optional[datetime] = None,
                                  end_date: Optional[datetime] = None,
                                  include_completed: bool = False) -> List[Dict]:
         """Get reminders due within a date range."""
+        # Ensure dates are timezone-aware
+        if start_date and not start_date.tzinfo:
+            start_date = start_date.replace(tzinfo=pytz.UTC)
+        if end_date and not end_date.tzinfo:
+            end_date = end_date.replace(tzinfo=pytz.UTC)
+        
         matching_reminders = []
         
         for reminders in self.lists.values():
@@ -454,6 +463,10 @@ class RemindersService:
                 due_date = reminder.get("due")
                 if not due_date:
                     continue
+                    
+                # Ensure reminder due date is timezone-aware
+                if due_date and not due_date.tzinfo:
+                    due_date = due_date.replace(tzinfo=pytz.UTC)
                     
                 if start_date and due_date < start_date:
                     continue

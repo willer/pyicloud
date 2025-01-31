@@ -2,11 +2,15 @@
 import getpass
 import keyring
 import sys
+import json
+from os import path
+from tempfile import gettempdir
 
 from .exceptions import PyiCloudNoStoredPasswordAvailableException
 
 
 KEYRING_SYSTEM = "pyicloud://icloud-password"
+TRUST_TOKEN_SYSTEM = "pyicloud://trust-token"
 
 
 def get_password(username, interactive=sys.stdout.isatty()):
@@ -74,3 +78,51 @@ def underscore_to_camelcase(word, initial_capital=False):
         words[0] = words[0].lower()
 
     return "".join(words)
+
+
+def get_default_token_directory():
+    """Get the default directory for storing trust tokens."""
+    topdir = path.join(gettempdir(), "pyicloud")
+    return path.join(topdir, getpass.getuser(), "tokens")
+
+
+def get_token_path(username, token_directory=None):
+    """Get the path for storing trust tokens."""
+    if not token_directory:
+        token_directory = get_default_token_directory()
+    return path.join(token_directory, f"{username}.token")
+
+
+def store_trust_token(username, trust_data, token_directory=None):
+    """Store trust token data for a username."""
+    token_path = get_token_path(username, token_directory)
+    
+    # Ensure directory exists
+    directory = path.dirname(token_path)
+    if not path.exists(directory):
+        from os import makedirs
+        makedirs(directory, mode=0o700, exist_ok=True)
+    
+    # Store token data
+    with open(token_path, 'w') as f:
+        json.dump(trust_data, f)
+
+
+def get_trust_token(username, token_directory=None):
+    """Get stored trust token data for a username."""
+    token_path = get_token_path(username, token_directory)
+    try:
+        with open(token_path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def delete_trust_token(username, token_directory=None):
+    """Delete stored trust token data for a username."""
+    token_path = get_token_path(username, token_directory)
+    try:
+        from os import remove
+        remove(token_path)
+    except FileNotFoundError:
+        pass

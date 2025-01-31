@@ -183,11 +183,10 @@ def main(args=None):
 
     if username and command_line.delete_from_keyring:
         utils.delete_password_in_keyring(username)
+        utils.delete_trust_token(username)
 
     failure_count = 0
     while True:
-        # Which password we use is determined by your username, so we
-        # do need to check for this first and separately.
         if not username:
             parser.error("No username supplied")
 
@@ -200,7 +199,17 @@ def main(args=None):
             parser.error("No password supplied")
 
         try:
-            api = PyiCloudService(username.strip(), password.strip(), china_mainland=china_mainland)
+            # Try to get stored trust token
+            trust_data = utils.get_trust_token(username)
+            
+            api = PyiCloudService(
+                username.strip(), 
+                password.strip(), 
+                china_mainland=china_mainland,
+                trust_data=trust_data
+            )
+            
+            # Handle keyring storage first
             if (
                 not utils.password_exists_in_keyring(username)
                 and command_line.interactive
@@ -208,55 +217,175 @@ def main(args=None):
             ):
                 utils.store_password_in_keyring(username, password)
 
-            if api.requires_2fa:
-                # fmt: off
-                print(
-                    "\nTwo-step authentication required.",
-                    "\nPlease enter validation code"
-                )
-                # fmt: on
+            # Handle 2FA before proceeding with any service calls
+            auth_successful = False
+            while not auth_successful:
+                if api.requires_2fa:
+                    print("\nTwo-factor authentication required. Please enter validation code:")
+                    code = input("Code: ")
+                    if not api.validate_2fa_code(code):
+                        print("Failed to verify verification code")
+                        if not command_line.interactive:
+                            sys.exit(1)
+                        continue
+                    print("Successfully verified 2FA code")
+                    
+                    # Store trust data after successful 2FA
+                    if api.session_data.get("trust_token"):
+                        utils.store_trust_token(username, {
+                            "trust_token": api.session_data["trust_token"],
+                            "session_token": api.session_data.get("session_token"),
+                            "scnt": api.session_data.get("scnt"),
+                            "session_id": api.session_data.get("session_id")
+                        })
+                    
+                    auth_successful = True
 
-                code = input("(string) --> ")
-                if not api.validate_2fa_code(code):
-                    print("Failed to verify verification code")
-                    sys.exit(1)
-
-                print("")
-
-            elif api.requires_2sa:
-                # fmt: off
-                print(
-                    "\nTwo-step authentication required.",
-                    "\nYour trusted devices are:"
-                )
-                # fmt: on
-
-                devices = api.trusted_devices
-                for i, device in enumerate(devices):
-                    print(
-                        "    %s: %s"
-                        % (
-                            i,
-                            device.get(
-                                "deviceName", "SMS to %s" % device.get("phoneNumber")
-                            ),
+                elif api.requires_2sa:
+                    print("\nTwo-step authentication required. Your trusted devices are:")
+                    devices = api.trusted_devices
+                    for i, device in enumerate(devices):
+                        print(
+                            "    %s: %s"
+                            % (
+                                i,
+                                device.get(
+                                    "deviceName", "SMS to %s" % device.get("phoneNumber")
+                                ),
+                            )
                         )
-                    )
 
-                print("\nWhich device would you like to use?")
-                device = int(input("(number) --> "))
-                device = devices[device]
-                if not api.send_verification_code(device):
-                    print("Failed to send verification code")
-                    sys.exit(1)
+                    device_index = int(input("\nWhich device would you like to use? (number) --> "))
+                    device = devices[device_index]
+                    if not api.send_verification_code(device):
+                        print("Failed to send verification code")
+                        if not command_line.interactive:
+                            sys.exit(1)
+                        continue
 
-                print("\nPlease enter validation code")
-                code = input("(string) --> ")
-                if not api.validate_verification_code(device, code):
-                    print("Failed to verify verification code")
-                    sys.exit(1)
+                    code = input("Please enter validation code received: ")
+                    if not api.validate_verification_code(device, code):
+                        print("Failed to verify verification code")
+                        if not command_line.interactive:
+                            sys.exit(1)
+                        continue
+                    print("Successfully verified 2SA code")
+                    
+                    # Store trust data after successful 2SA
+                    if api.session_data.get("trust_token"):
+                        utils.store_trust_token(username, {
+                            "trust_token": api.session_data["trust_token"],
+                            "session_token": api.session_data.get("session_token"),
+                            "scnt": api.session_data.get("scnt"),
+                            "session_id": api.session_data.get("session_id")
+                        })
+                    
+                    auth_successful = True
+                else:
+                    auth_successful = True
 
-                print("")
+            # Force a fresh authentication after 2FA
+            if auth_successful:
+                api.authenticate(force_refresh=True)
+
+            # Now proceed with service calls
+            if command_line.list:
+                for dev in api.devices:
+                    print(dev)
+                break
+
+            for dev in api.devices:
+                if not command_line.device_id or (
+                    command_line.device_id.strip().lower() == dev.content["id"].strip().lower()
+                ):
+                    # List device(s)
+                    if command_line.locate:
+                        dev.location()
+
+                    if command_line.output_to_file:
+                        create_pickled_data(
+                            dev,
+                            filename=(dev.content["name"].strip().lower() + ".fmip_snapshot"),
+                        )
+
+                    contents = dev.content
+                    if command_line.longlist:
+                        print("-" * 30)
+                        print(contents["name"])
+                        for key in contents:
+                            print("%20s - %s" % (key, contents[key]))
+                    elif command_line.list:
+                        print("-" * 30)
+                        print("Name - %s" % contents["name"])
+                        print("Display Name  - %s" % contents["deviceDisplayName"])
+                        print("Location      - %s" % contents["location"])
+                        print("Battery Level - %s" % contents["batteryLevel"])
+                        print("Battery Status- %s" % contents["batteryStatus"])
+                        print("Device Class  - %s" % contents["deviceClass"])
+                        print("Device Model  - %s" % contents["deviceModel"])
+
+                    # Play a Sound on a device
+                    if command_line.sound:
+                        if command_line.device_id:
+                            dev.play_sound()
+                        else:
+                            raise RuntimeError(
+                                "\n\n\t\t%s %s\n\n"
+                                % (
+                                    "Sounds can only be played on a singular device.",
+                                    DEVICE_ERROR,
+                                )
+                            )
+
+                    # Display a Message on the device
+                    if command_line.message:
+                        if command_line.device_id:
+                            dev.display_message(
+                                subject="A Message", message=command_line.message, sounds=True
+                            )
+                        else:
+                            raise RuntimeError(
+                                "%s %s"
+                                % (
+                                    "Messages can only be played on a singular device.",
+                                    DEVICE_ERROR,
+                                )
+                            )
+
+                    # Display a Silent Message on the device
+                    if command_line.silentmessage:
+                        if command_line.device_id:
+                            dev.display_message(
+                                subject="A Silent Message",
+                                message=command_line.silentmessage,
+                                sounds=False,
+                            )
+                        else:
+                            raise RuntimeError(
+                                "%s %s"
+                                % (
+                                    "Silent Messages can only be played "
+                                    "on a singular device.",
+                                    DEVICE_ERROR,
+                                )
+                            )
+
+                    # Enable Lost mode
+                    if command_line.lostmode:
+                        if command_line.device_id:
+                            dev.lost_device(
+                                number=command_line.lost_phone.strip(),
+                                text=command_line.lost_message.strip(),
+                                newpasscode=command_line.lost_password.strip(),
+                            )
+                        else:
+                            raise RuntimeError(
+                                "%s %s"
+                                % (
+                                    "Lost Mode can only be activated on a singular device.",
+                                    DEVICE_ERROR,
+                                )
+                            )
             break
         except PyiCloudFailedLoginException as err:
             # If they have a stored password; we just used it and
@@ -275,98 +404,6 @@ def main(args=None):
 
             print(message, file=sys.stderr)
 
-    for dev in api.devices:
-        if not command_line.device_id or (
-            command_line.device_id.strip().lower() == dev.content["id"].strip().lower()
-        ):
-            # List device(s)
-            if command_line.locate:
-                dev.location()
-
-            if command_line.output_to_file:
-                create_pickled_data(
-                    dev,
-                    filename=(dev.content["name"].strip().lower() + ".fmip_snapshot"),
-                )
-
-            contents = dev.content
-            if command_line.longlist:
-                print("-" * 30)
-                print(contents["name"])
-                for key in contents:
-                    print("%20s - %s" % (key, contents[key]))
-            elif command_line.list:
-                print("-" * 30)
-                print("Name - %s" % contents["name"])
-                print("Display Name  - %s" % contents["deviceDisplayName"])
-                print("Location      - %s" % contents["location"])
-                print("Battery Level - %s" % contents["batteryLevel"])
-                print("Battery Status- %s" % contents["batteryStatus"])
-                print("Device Class  - %s" % contents["deviceClass"])
-                print("Device Model  - %s" % contents["deviceModel"])
-
-            # Play a Sound on a device
-            if command_line.sound:
-                if command_line.device_id:
-                    dev.play_sound()
-                else:
-                    raise RuntimeError(
-                        "\n\n\t\t%s %s\n\n"
-                        % (
-                            "Sounds can only be played on a singular device.",
-                            DEVICE_ERROR,
-                        )
-                    )
-
-            # Display a Message on the device
-            if command_line.message:
-                if command_line.device_id:
-                    dev.display_message(
-                        subject="A Message", message=command_line.message, sounds=True
-                    )
-                else:
-                    raise RuntimeError(
-                        "%s %s"
-                        % (
-                            "Messages can only be played on a singular device.",
-                            DEVICE_ERROR,
-                        )
-                    )
-
-            # Display a Silent Message on the device
-            if command_line.silentmessage:
-                if command_line.device_id:
-                    dev.display_message(
-                        subject="A Silent Message",
-                        message=command_line.silentmessage,
-                        sounds=False,
-                    )
-                else:
-                    raise RuntimeError(
-                        "%s %s"
-                        % (
-                            "Silent Messages can only be played "
-                            "on a singular device.",
-                            DEVICE_ERROR,
-                        )
-                    )
-
-            # Enable Lost mode
-            if command_line.lostmode:
-                if command_line.device_id:
-                    dev.lost_device(
-                        number=command_line.lost_phone.strip(),
-                        text=command_line.lost_message.strip(),
-                        newpasscode=command_line.lost_password.strip(),
-                    )
-                else:
-                    raise RuntimeError(
-                        "%s %s"
-                        % (
-                            "Lost Mode can only be activated on a singular device.",
-                            DEVICE_ERROR,
-                        )
-                    )
     sys.exit(0)
 
 

@@ -11,6 +11,7 @@ import http.cookiejar as cookielib
 import getpass
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from datetime import datetime
 
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -63,18 +64,19 @@ class PyiCloudSession(Session):
     def __init__(self, service):
         self.service = service
         super().__init__()
-        # Configure minimal retry strategy - only for network errors
+        # Configure more robust retry strategy
         self.retry_strategy = Retry(
-            total=2,  # Reduced from 5
-            connect=2,  # Only retry on connection errors
-            read=2,    # Only retry on read errors
-            backoff_factor=1,
-            status_forcelist=[429, 503],  # Remove 500s, only retry on rate limits and temp unavailable
+            total=3,  # Increased from 2
+            connect=3,  # Increased retries for connection errors
+            read=3,    # Increased retries for read errors
+            backoff_factor=1.5,  # Increased backoff factor
+            status_forcelist=[429, 500, 502, 503, 504],  # Added more error codes
             allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
             respect_retry_after_header=True,
-            raise_on_status=True  # Let the service handle HTTP errors
+            raise_on_status=True
         )
         self.mount('https://', HTTPAdapter(max_retries=self.retry_strategy))
+        self._last_auth_time = None
 
     def request(self, method, url, **kwargs):
         """Make a request with improved logging and error handling."""
@@ -88,47 +90,83 @@ class PyiCloudSession(Session):
         request_logger.debug("%s %s %s", method, url, kwargs.get("data", ""))
 
         # Make request
-        response = super().request(method, url, **kwargs)
+        try:
+            response = super().request(method, url, **kwargs)
+            
+            # Handle auth errors first, before any error raising
+            if (response.status_code in (450, 500) and 'Authentication required' in response.text) or \
+               (response.status_code == 401) or \
+               (response.status_code == 403):
+                request_logger.debug("Got auth error %d, attempting refresh", response.status_code)
+                
+                # Clear existing tokens and cookies
+                self.cookies.clear()
+                self.service.session_data.clear()
+                
+                # Re-authenticate with force refresh
+                self.service.authenticate(True)
+                self._last_auth_time = datetime.now()
+                
+                # Retry the request with fresh auth
+                request = response.request
+                if isinstance(request.body, bytes):
+                    request.body = request.body.decode('utf-8')
+                    
+                # Update headers with new auth tokens
+                request.headers.update(self._get_auth_headers())
+                
+                response = self.send(request)
+                request_logger.debug("Retried request after auth refresh, status: %d", response.status_code)
 
-        # Handle response
-        content_type = response.headers.get("Content-Type", "").split(";")[0]
-        json_mimetypes = ["application/json", "text/json"]
+            # Handle other response processing
+            content_type = response.headers.get("Content-Type", "").split(";")[0]
+            json_mimetypes = ["application/json", "text/json"]
 
-        # Update session data from headers
-        for header, value in HEADER_DATA.items():
-            if response.headers.get(header):
-                session_arg = value
-                self.service.session_data.update(
-                    {session_arg: response.headers.get(header)}
-                )
+            # Update session data from headers
+            for header, value in HEADER_DATA.items():
+                if response.headers.get(header):
+                    session_arg = value
+                    self.service.session_data.update(
+                        {session_arg: response.headers.get(header)}
+                    )
 
-        # Save session data
-        with open(self.service.session_path, "w", encoding="utf-8") as outfile:
-            json.dump(self.service.session_data, outfile)
-            request_logger.debug("Saved session data to file")
+            # Save session data
+            with open(self.service.session_path, "w", encoding="utf-8") as outfile:
+                json.dump(self.service.session_data, outfile)
+                request_logger.debug("Saved session data to file")
 
-        # Save cookies
-        self.cookies.save(ignore_discard=True, ignore_expires=True)
-        request_logger.debug("Cookies saved to %s", self.service.cookiejar_path)
+            # Save cookies
+            self.cookies.save(ignore_discard=True, ignore_expires=True)
+            request_logger.debug("Cookies saved to %s", self.service.cookiejar_path)
 
-        # Handle error responses
-        if not response.ok and (
-            content_type not in json_mimetypes
-            or response.status_code in [421, 450, 500]
-        ):
-            # Let individual services handle retries for auth/service errors
-            if response.status_code in [421, 450, 500]:
+            # Now handle other errors
+            if not response.ok and (
+                content_type not in json_mimetypes
+                or response.status_code in [421, 450, 500]
+            ):
                 request_logger.warning(
-                    "Got status %d: %s", 
+                    "Got error status %d: %s", 
                     response.status_code,
                     response.text if response.text else "No error message"
                 )
                 self._raise_error(response.status_code, response.reason)
-            
-            # Only retry network errors (handled by urllib3)
-            self._raise_error(response.status_code, response.reason)
 
-        return response
+            return response
+            
+        except Exception as e:
+            request_logger.error("Request failed: %s", str(e))
+            raise
+
+    def _get_auth_headers(self):
+        """Get current authentication headers"""
+        headers = {}
+        if self.service.session_data.get("session_token"):
+            headers["X-Apple-Session-Token"] = self.service.session_data["session_token"]
+        if self.service.session_data.get("scnt"):
+            headers["scnt"] = self.service.session_data["scnt"]
+        if self.service.session_data.get("session_id"):
+            headers["X-Apple-ID-Session-Id"] = self.service.session_data["session_id"]
+        return headers
 
     def _raise_error(self, code, reason):
         if (
@@ -182,6 +220,7 @@ class PyiCloudService:
         client_id=None,
         with_family=True,
         china_mainland=False,
+        trust_data=None,
     ):
         # If the country or region setting of your Apple ID is China mainland.
         # See https://support.apple.com/en-us/HT208351
@@ -222,6 +261,12 @@ class PyiCloudService:
                 self.session_data = json.load(session_f)
         except:  # pylint: disable=bare-except
             LOGGER.info("Session file does not exist")
+            
+        # Update session data with trust data if provided
+        if trust_data:
+            LOGGER.debug("Using provided trust data")
+            self.session_data.update(trust_data)
+            
         if self.session_data.get("client_id"):
             self.client_id = self.session_data.get("client_id")
         else:
@@ -246,45 +291,59 @@ class PyiCloudService:
                 LOGGER.warning("Failed to read cookiejar %s", cookiejar_path)
 
         self.authenticate()
-
+        self._webservices = self.data["webservices"]
+        
         self._drive = None
         self._files = None
         self._photos = None
 
     def authenticate(self, force_refresh=False, service=None):
-        """
-        Handles authentication, and persists cookies so that
-        subsequent logins will not cause additional e-mails from Apple.
-        """
-
+        """Authenticate or re-authenticate to iCloud."""
+        if force_refresh:
+            LOGGER.debug("Forcing authentication refresh")
+            self.session.cookies.clear()
+            self.session.headers.clear()
+            # Don't clear session data on force refresh if we have a trust token
+            if not self.session_data.get("trust_token"):
+                self.session_data.clear()
+            self.session.headers.update({
+                'Origin': self.HOME_ENDPOINT,
+                'Referer': f"{self.HOME_ENDPOINT}/",
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)'
+            })
+        
         login_successful = False
         if self.session_data.get("session_token") and not force_refresh:
             LOGGER.debug("Checking session token validity")
             try:
                 self.data = self._validate_token()
                 login_successful = True
+                LOGGER.debug("Existing session token is valid")
             except PyiCloudAPIResponseException:
-                LOGGER.debug("Invalid authentication token, will log in from scratch.")
+                LOGGER.debug("Invalid authentication token, will log in from scratch")
+                self.session_data.clear()
+                self.session.cookies.clear()
 
         if not login_successful and service is not None:
-            app = self.data["apps"][service]
-            if "canLaunchWithOneFactor" in app and app["canLaunchWithOneFactor"]:
+            LOGGER.debug("Attempting service-specific authentication for %s", service)
+            app = self.data.get("apps", {}).get(service)
+            if app and app.get("canLaunchWithOneFactor"):
                 LOGGER.debug(
                     "Authenticating as %s for %s", self.user["accountName"], service
                 )
                 try:
                     self._authenticate_with_credentials_service(service)
                     login_successful = True
-                except Exception:
+                    LOGGER.debug("Service-specific authentication successful")
+                except Exception as e:
                     LOGGER.debug(
-                        "Could not log into service. Attempting brand new login."
+                        "Service-specific authentication failed: %s. Attempting full login.", str(e)
                     )
 
         if not login_successful:
-            LOGGER.debug("Authenticating as %s", self.user["accountName"])
+            LOGGER.debug("Performing full authentication as %s", self.user["accountName"])
 
             data = dict(self.user)
-
             data["rememberMe"] = True
             data["trustTokens"] = []
             if self.session_data.get("trust_token"):
@@ -299,20 +358,31 @@ class PyiCloudService:
                 headers["X-Apple-ID-Session-Id"] = self.session_data.get("session_id")
 
             try:
-                self.session.post(
-                    "%s/signin" % self.AUTH_ENDPOINT,
-                    params={"isRememberMeEnabled": "true"},
-                    data=json.dumps(data),
-                    headers=headers,
-                )
+                # First try validating existing session
+                if not force_refresh and self.session_data:
+                    try:
+                        self.data = self._validate_token()
+                        login_successful = True
+                        LOGGER.debug("Existing session validated successfully")
+                    except:
+                        LOGGER.debug("Session validation failed, proceeding with full login")
+                
+                if not login_successful:
+                    LOGGER.debug("Performing full sign-in")
+                    self.session.post(
+                        "%s/signin" % self.AUTH_ENDPOINT,
+                        params={"isRememberMeEnabled": "true"},
+                        data=json.dumps(data),
+                        headers=headers,
+                    )
+                    self._authenticate_with_token()
+                    LOGGER.debug("Full authentication completed successfully")
+
             except PyiCloudAPIResponseException as error:
                 msg = "Invalid email/password combination."
                 raise PyiCloudFailedLoginException(msg, error) from error
 
-            self._authenticate_with_token()
-
         self._webservices = self.data["webservices"]
-
         LOGGER.debug("Authentication completed successfully")
 
     def _authenticate_with_token(self):
