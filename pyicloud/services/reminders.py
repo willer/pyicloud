@@ -75,7 +75,7 @@ class RemindersService:
         self._reminders_by_guid = {}
         self._tags = set()
         
-        # Add service-specific headers
+        # Add service-specific headers for iOS 13+ format
         self.session.headers.update({
             "Origin": "https://www.icloud.com",
             "Referer": "https://www.icloud.com/reminders/",
@@ -85,21 +85,23 @@ class RemindersService:
             "X-Apple-Service": "reminders",
             "X-Apple-Auth-Token": session.service.session_data.get("session_token"),
             "X-Apple-Domain-Id": "reminders",
-            "X-Apple-I-FD-Client-Info": "{\"app\":{\"name\":\"reminders\",\"version\":\"1.0\"}}",
-            "X-Apple-App-Version": "1.0",
+            "X-Apple-I-FD-Client-Info": "{\"app\":{\"name\":\"reminders\",\"version\":\"2.0\"}}",  # Updated version
+            "X-Apple-App-Version": "2.0",  # Updated version
             "X-Apple-Web-Session-Token": session.service.session_data.get("session_token"),
             "Content-Type": "application/json",
+            "X-Apple-I-TimeZone": get_localzone_name(),  # Added timezone
+            "X-Apple-I-ClientTime": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),  # Added client time
         })
-
-        # Add service-specific parameters
+        
+        # Add service-specific parameters for iOS 13+ format
         self.params.update({
-            "clientBuildNumber": "2020Project52",
-            "clientMasteringNumber": "2020B29",
+            "clientBuildNumber": "2023Project70",  # Updated build number
+            "clientMasteringNumber": "2023B70",    # Updated mastering number
             "clientId": session.service.client_id,
             "dsid": session.service.data.get("dsInfo", {}).get("dsid"),
             "lang": "en-us",
             "usertz": get_localzone_name(),
-            "remindersWebUIVersion": "1.0",
+            "remindersWebUIVersion": "2.0",  # Updated version
         })
         
         # Initial refresh
@@ -112,11 +114,46 @@ class RemindersService:
             return True
             
         try:
+            # Force authentication refresh for reminders service
             self.session.service.authenticate(True, "reminders")
+            
+            # Update headers with new tokens
+            self.session.headers.update({
+                "Origin": "https://www.icloud.com",
+                "Referer": "https://www.icloud.com/reminders/",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-Apple-Service": "reminders",
+                "X-Apple-Auth-Token": self.session.service.session_data.get("session_token"),
+                "X-Apple-Domain-Id": "reminders",
+                "X-Apple-I-FD-Client-Info": "{\"app\":{\"name\":\"reminders\",\"version\":\"2.0\"}}",
+                "X-Apple-App-Version": "2.0",
+                "X-Apple-Web-Session-Token": self.session.service.session_data.get("session_token"),
+                "Content-Type": "application/json",
+                "X-Apple-I-TimeZone": get_localzone_name(),
+                "X-Apple-I-ClientTime": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+            
+            # Update service-specific parameters
+            self.params.update({
+                "clientBuildNumber": "2023Project70",
+                "clientMasteringNumber": "2023B70",
+                "clientId": self.session.service.client_id,
+                "dsid": self.session.service.data.get("dsInfo", {}).get("dsid"),
+                "lang": "en-us",
+                "usertz": get_localzone_name(),
+                "remindersWebUIVersion": "2.0",
+            })
+            
             self.token_expiry = now + AUTH_TOKEN_EXPIRY
             return True
+            
         except Exception as e:
             LOGGER.error("Failed to refresh auth token: %s", str(e))
+            # Add exponential backoff for auth failures
+            retry_after = min(int(time.time() - self.token_expiry), 30)  # Cap at 30 seconds
+            time.sleep(retry_after)
             return False
 
     def _batch_request(self, operations: List[Dict[str, Any]], force: bool = False) -> bool:
@@ -173,43 +210,78 @@ class RemindersService:
     def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None,
                      params: Optional[Dict] = None, timeout: int = REQUEST_TIMEOUT) -> Optional[Any]:
         """Make an authenticated request with minimal retries."""
-        if not self._authenticate_before_request():
-            raise NonRetryableError("Failed to authenticate")
-            
-        try:
-            LOGGER.debug(f"Making {method} request to {endpoint}")
-            request_params = {**self.params, **(params or {})}
-            
-            if method.lower() == 'get':
-                response = self.session.get(
-                    f"{self._service_root}{endpoint}",
-                    params=request_params,
-                    timeout=timeout
-                )
-            else:
-                response = self.session.post(
-                    f"{self._service_root}{endpoint}",
-                    data=json.dumps(data) if data else None,
-                    params=request_params,
-                    timeout=timeout
-                )
+        max_retries = 3
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < max_retries:
+            if not self._authenticate_before_request():
+                retry_count += 1
+                if retry_count == max_retries:
+                    raise NonRetryableError("Failed to authenticate after multiple attempts")
+                continue
                 
-            # Handle different error cases
-            if response.status_code == 401 or \
-               (response.status_code == 500 and "Authentication required" in response.text):
-                # Auth error - let session handle it
-                raise NonRetryableError("Authentication failed")
+            try:
+                LOGGER.debug(f"Making {method} request to {endpoint}")
+                request_params = {**self.params, **(params or {})}
                 
-            elif response.status_code >= 400:
-                # Other errors - non-retryable
-                raise NonRetryableError(f"HTTP {response.status_code}: {response.text}")
+                if method.lower() == 'get':
+                    response = self.session.get(
+                        f"{self._service_root}{endpoint}",
+                        params=request_params,
+                        timeout=timeout
+                    )
+                else:
+                    response = self.session.post(
+                        f"{self._service_root}{endpoint}",
+                        data=json.dumps(data) if data else None,
+                        params=request_params,
+                        timeout=timeout
+                    )
+                    
+                # Handle different error cases
+                if response.status_code == 401:
+                    LOGGER.debug("Got 401, attempting auth refresh")
+                    self.token_expiry = 0  # Force auth refresh
+                    retry_count += 1
+                    continue
+                    
+                elif response.status_code == 500 and "Authentication required" in response.text:
+                    LOGGER.debug("Got auth required error, attempting auth refresh")
+                    self.token_expiry = 0  # Force auth refresh
+                    retry_count += 1
+                    continue
+                    
+                elif response.status_code == 503:
+                    # Service unavailable - retry with backoff
+                    retry_after = min(int(response.headers.get('Retry-After', 2)), 5)  # Cap at 5 seconds
+                    LOGGER.warning("Got 503, waiting %d seconds before retry", retry_after)
+                    time.sleep(retry_after)
+                    retry_count += 1
+                    continue
+                    
+                elif response.status_code >= 400:
+                    # Other errors - non-retryable
+                    LOGGER.error("Got error status %d: %s", 
+                               response.status_code,
+                               response.text if response.text else "No error message")
+                    raise NonRetryableError(f"HTTP {response.status_code}: {response.text}")
+                    
+                response.raise_for_status()
+                return response.json()
                 
-            response.raise_for_status()
-            return response
-            
-        except Exception as e:
-            LOGGER.error(f"Request failed: {str(e)}")
-            raise NonRetryableError(str(e))
+            except Exception as e:
+                last_error = e
+                LOGGER.error(f"Request failed: {str(e)}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(2 ** retry_count)  # Exponential backoff
+                    continue
+                raise NonRetryableError(str(e))
+                
+        if last_error:
+            raise NonRetryableError(f"Max retries exceeded: {str(last_error)}")
+        return None
 
     def refresh(self, force: bool = False) -> bool:
         """Refresh data with caching."""
@@ -222,7 +294,8 @@ class RemindersService:
             return False
 
         try:
-            data = response.json()
+            # Remove the redundant .json() call since response is already parsed
+            data = response
             
             # Clear existing data
             self.lists.clear()
@@ -305,55 +378,49 @@ class RemindersService:
             new_guid = str(uuid.uuid4())
             now = datetime.now(pytz.UTC)
             
+            # Updated reminder data structure for iOS 13+
             reminder_data = {
-                "guid": new_guid,
-                "title": title,
-                "description": description or "",
-                "pGuid": pguid,
-                "etag": None,
-                "order": 0,
-                "priority": priority,
-                "recurrence": self._format_recurrence(recurrence),
-                "createdDateExtended": int(now.timestamp() * 1000),
-                "lastModifiedDate": int(now.timestamp() * 1000),
-                "dueDateIsAllDay": False,
-                "tags": tags or [],
-                "completed": False,
-                "completedDate": None,
-                "alarms": [],
-                "recurrenceMaster": None,
-                "startDate": None,
-                "startDateTz": None,
-                "startDateIsAllDay": False,
-                "isFamily": False,
-                "createdDate": [
-                    int(f"{now.year}{now.month:02d}{now.day:02d}"),
-                    now.year,
-                    now.month,
-                    now.day,
-                    now.hour,
-                    now.minute,
-                    now.second
-                ]
+                "fields": {  # New fields wrapper for iOS 13+
+                    "guid": new_guid,
+                    "title": title,
+                    "description": description or "",
+                    "pGuid": pguid,
+                    "etag": None,
+                    "order": 0,
+                    "priority": priority,
+                    "recurrence": self._format_recurrence(recurrence),
+                    "createdDateExtended": int(now.timestamp() * 1000),
+                    "lastModifiedDate": int(now.timestamp() * 1000),
+                    "dueDateIsAllDay": False,
+                    "tags": tags or [],
+                    "completed": False,
+                    "completedDate": None,
+                    "alarms": [],
+                    "recurrenceMaster": None,
+                    "startDate": None,
+                    "startDateTz": None,
+                    "startDateIsAllDay": False,
+                    "isFamily": False,
+                    "createdDate": self._format_date(now),
+                    "hasSubtasks": False,  # New iOS 13+ field
+                    "hasAttachments": False,  # New iOS 13+ field
+                    "isShared": False,  # New iOS 13+ field
+                    "subtaskOrder": [],  # New iOS 13+ field
+                    "attachments": [],  # New iOS 13+ field
+                    "flagged": False,  # New iOS 13+ field
+                    "locationBasedAlerts": False,  # New iOS 13+ field
+                }
             }
 
             # Add due date if provided
             due_date = kwargs.get("due_date")
             if due_date:
                 if not due_date.tzinfo:
-                    local_tz = pytz.timezone('America/Los_Angeles')
+                    local_tz = pytz.timezone(get_localzone_name())
                     due_date = local_tz.localize(due_date)
                 utc_date = due_date.astimezone(pytz.UTC)
-                reminder_data.update({
-                    "dueDate": [
-                        int(f"{utc_date.year}{utc_date.month:02d}{utc_date.day:02d}"),
-                        utc_date.year,
-                        utc_date.month,
-                        utc_date.day,
-                        utc_date.hour,
-                        utc_date.minute,
-                        utc_date.second
-                    ],
+                reminder_data["fields"].update({
+                    "dueDate": self._format_date(utc_date),
                     "dueDateTz": "UTC"
                 })
 
@@ -361,7 +428,7 @@ class RemindersService:
             response = self._make_request(
                 "post",
                 "/rd/reminders/tasks",
-                data={"Reminder": reminder_data},
+                data=reminder_data,  # No longer wrapping in "Reminder"
                 timeout=REQUEST_TIMEOUT
             )
 
@@ -378,13 +445,17 @@ class RemindersService:
                     "tags": tags or [],
                     "recurrence": recurrence,
                     "p_guid": pguid,
+                    "hasSubtasks": False,
+                    "hasAttachments": False,
+                    "isShared": False,
+                    "flagged": False,
                 }
                 self._reminders_by_guid[new_guid] = cache_data
                 self.lists[collection].append(cache_data)
                 if tags:
                     self._tags.update(tags)
                 return new_guid
-                
+
         except NonRetryableError as e:
             LOGGER.error(f"Failed to create reminder: {str(e)}")
         except Exception as e:
@@ -412,19 +483,37 @@ class RemindersService:
             if collection in self.collections:
                 pguid = self.collections[collection]["guid"]
 
+        # Updated reminder data structure for iOS 13+
         update_data = {
-            "guid": guid,
-            "pGuid": pguid,
-            "title": title if title is not None else current["title"],
-            "description": description if description is not None else current.get("desc", ""),
-            "priority": priority if priority is not None else current.get("priority", Priority.NONE),
-            "tags": tags if tags is not None else current.get("tags", []),
-            "recurrence": self._format_recurrence(recurrence) if recurrence else None,
-            "lastModifiedDate": self._format_date(datetime.now()),
+            "fields": {
+                "guid": guid,
+                "pGuid": pguid,
+                "title": title if title is not None else current["title"],
+                "description": description if description is not None else current.get("desc", ""),
+                "priority": priority if priority is not None else current.get("priority", Priority.NONE),
+                "tags": tags if tags is not None else current.get("tags", []),
+                "recurrence": self._format_recurrence(recurrence) if recurrence else None,
+                "lastModifiedDate": int(time.time() * 1000),
+                "hasSubtasks": current.get("hasSubtasks", False),
+                "hasAttachments": current.get("hasAttachments", False),
+                "isShared": current.get("isShared", False),
+                "flagged": current.get("flagged", False),
+                "locationBasedAlerts": current.get("locationBasedAlerts", False),
+                "subtaskOrder": current.get("subtaskOrder", []),
+                "attachments": current.get("attachments", []),
+            }
         }
 
         if due_date is not None:
-            update_data.update(self._format_due_date(due_date))
+            if not due_date.tzinfo:
+                local_tz = pytz.timezone(get_localzone_name())
+                due_date = local_tz.localize(due_date)
+            utc_date = due_date.astimezone(pytz.UTC)
+            update_data["fields"].update({
+                "dueDate": self._format_date(utc_date),
+                "dueDateTz": "UTC",
+                "dueDateIsAllDay": False
+            })
 
         success = self._queue_operation(
             BatchOperation.UPDATE,
@@ -435,13 +524,17 @@ class RemindersService:
         if success:
             # Update local cache
             current.update({
-                "title": update_data["title"],
-                "desc": update_data["description"],
+                "title": update_data["fields"]["title"],
+                "desc": update_data["fields"]["description"],
                 "due": due_date if due_date is not None else current.get("due"),
-                "priority": update_data["priority"],
-                "tags": update_data["tags"],
+                "priority": update_data["fields"]["priority"],
+                "tags": update_data["fields"]["tags"],
                 "recurrence": recurrence,
                 "p_guid": pguid,
+                "hasSubtasks": update_data["fields"]["hasSubtasks"],
+                "hasAttachments": update_data["fields"]["hasAttachments"],
+                "isShared": update_data["fields"]["isShared"],
+                "flagged": update_data["fields"]["flagged"]
             })
             
             # Update collection if changed
@@ -465,11 +558,21 @@ class RemindersService:
             return False
 
         complete_data = {
-            "guid": guid,
-            "pGuid": reminder["p_guid"],
-            "title": reminder["title"],
-            "completedDate": int(time.time() * 1000),
-            "lastModifiedDate": self._format_date(datetime.now()),
+            "fields": {
+                "guid": guid,
+                "pGuid": reminder["p_guid"],
+                "title": reminder["title"],
+                "completedDate": int(time.time() * 1000),
+                "lastModifiedDate": int(time.time() * 1000),
+                "completed": True,
+                "hasSubtasks": reminder.get("hasSubtasks", False),
+                "hasAttachments": reminder.get("hasAttachments", False),
+                "isShared": reminder.get("isShared", False),
+                "flagged": reminder.get("flagged", False),
+                "locationBasedAlerts": reminder.get("locationBasedAlerts", False),
+                "subtaskOrder": reminder.get("subtaskOrder", []),
+                "attachments": reminder.get("attachments", []),
+            }
         }
 
         success = self._queue_operation(
@@ -480,6 +583,7 @@ class RemindersService:
 
         if success:
             reminder["completed"] = True
+            reminder["completedDate"] = int(time.time() * 1000)
             return True
         return False
 
@@ -581,11 +685,21 @@ class RemindersService:
                 continue
                 
             complete_data = {
-                "guid": guid,
-                "pGuid": reminder["p_guid"],
-                "title": reminder["title"],
-                "completedDate": int(time.time() * 1000),
-                "lastModifiedDate": self._format_date(datetime.now()),
+                "fields": {
+                    "guid": guid,
+                    "pGuid": reminder["p_guid"],
+                    "title": reminder["title"],
+                    "completedDate": int(time.time() * 1000),
+                    "lastModifiedDate": int(time.time() * 1000),
+                    "completed": True,
+                    "hasSubtasks": reminder.get("hasSubtasks", False),
+                    "hasAttachments": reminder.get("hasAttachments", False),
+                    "isShared": reminder.get("isShared", False),
+                    "flagged": reminder.get("flagged", False),
+                    "locationBasedAlerts": reminder.get("locationBasedAlerts", False),
+                    "subtaskOrder": reminder.get("subtaskOrder", []),
+                    "attachments": reminder.get("attachments", []),
+                }
             }
             operations.append({
                 "type": BatchOperation.COMPLETE,
@@ -596,12 +710,13 @@ class RemindersService:
             success = self._batch_request(operations)
             if success:
                 for op in operations:
-                    guid = op["data"]["guid"]
+                    guid = op["data"]["fields"]["guid"]
                     self._reminders_by_guid[guid]["completed"] = True
+                    self._reminders_by_guid[guid]["completedDate"] = int(time.time() * 1000)
                     results[guid] = True
             else:
                 for op in operations:
-                    results[op["data"]["guid"]] = False
+                    results[op["data"]["fields"]["guid"]] = False
                     
         return results
 
@@ -621,10 +736,19 @@ class RemindersService:
                 continue
                 
             move_data = {
-                "guid": guid,
-                "pGuid": target_pguid,
-                "title": reminder["title"],
-                "lastModifiedDate": self._format_date(datetime.now()),
+                "fields": {
+                    "guid": guid,
+                    "pGuid": target_pguid,
+                    "title": reminder["title"],
+                    "lastModifiedDate": int(time.time() * 1000),
+                    "hasSubtasks": reminder.get("hasSubtasks", False),
+                    "hasAttachments": reminder.get("hasAttachments", False),
+                    "isShared": reminder.get("isShared", False),
+                    "flagged": reminder.get("flagged", False),
+                    "locationBasedAlerts": reminder.get("locationBasedAlerts", False),
+                    "subtaskOrder": reminder.get("subtaskOrder", []),
+                    "attachments": reminder.get("attachments", []),
+                }
             }
             operations.append({
                 "type": BatchOperation.UPDATE,
@@ -635,7 +759,7 @@ class RemindersService:
             success = self._batch_request(operations)
             if success:
                 for op in operations:
-                    guid = op["data"]["guid"]
+                    guid = op["data"]["fields"]["guid"]
                     reminder = self._reminders_by_guid[guid]
                     old_collection = reminder["collection"]
                     self.lists[old_collection].remove(reminder)
@@ -645,7 +769,7 @@ class RemindersService:
                     results[guid] = True
             else:
                 for op in operations:
-                    results[op["data"]["guid"]] = False
+                    results[op["data"]["fields"]["guid"]] = False
                     
         return results
 

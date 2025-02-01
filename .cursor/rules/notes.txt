@@ -1,0 +1,2 @@
+Always keep notes of what ideas worked and what didn't work in the NOTES.md file.
+This way you will remember them as your context window gets purged.

@@ -1,0 +1,4 @@
+This repository contains a set of code and test scripts to implement iCloud
+integration. The focus for the moment is on reminders, but other types may
+become in context.
+Details are in README.md. Lab notes are in NOTES.md.

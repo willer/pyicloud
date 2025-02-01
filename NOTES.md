@@ -395,3 +395,69 @@ The iCloud web API requires proper authentication for each service. For reminder
 1. Should we maintain backward compatibility with pre-iOS 13 Reminders?
 2. How to handle mixed environments where some lists are upgraded and others aren't?
 3. What's the best way to detect list format version?
+
+# pyiCloud Development Notes
+
+## iOS 13+ Reminders API Update
+
+### Changes Made
+1. Updated RemindersService to support iOS 13+ format:
+   - Added new fields wrapper structure
+   - Added new fields: hasSubtasks, hasAttachments, isShared
+   - Updated API version to 2.0
+   - Added timezone and client time headers
+
+2. Enhanced base authentication:
+   - Added service-specific authentication parameters
+   - Improved session token handling
+   - Added validation of existing sessions before re-auth
+   - Updated build and mastering numbers
+
+3. Added comprehensive test suite:
+   - Basic CRUD operations
+   - Mock responses matching new API format
+   - Fixtures for service testing
+
+### Learnings
+1. iOS 13+ made significant changes to the Reminders API:
+   - Moved to a fields-based structure
+   - Added support for subtasks and attachments
+   - Requires additional headers for timezone and client time
+
+2. Authentication flow improvements:
+   - Session tokens can be reused
+   - Service-specific parameters are crucial
+   - Need to maintain cookies between requests
+
+### Future Improvements
+1. Consider adding support for:
+   - Subtasks management
+   - Attachments handling
+   - Shared list functionality
+   - List color and icon customization
+
+2. Technical debt to address:
+   - Add type hints throughout the codebase
+   - Improve error handling and recovery
+   - Add integration tests with real API responses
+   - Consider moving to async/await pattern
+
+### Known Issues
+1. Authentication:
+   - Need to handle 2FA more gracefully
+   - Session token expiration needs better handling
+
+2. API Compatibility:
+   - Need to maintain backward compatibility for pre-iOS 13
+   - Some advanced features may not work on older iOS versions
+
+### Testing Notes
+1. Test environment setup:
+   - Use pytest fixtures for mocking
+   - Mock network calls to avoid real API access
+   - Use realistic sample data in tests
+
+2. Test coverage:
+   - Basic CRUD operations covered
+   - Need more edge case testing
+   - Need error condition testing

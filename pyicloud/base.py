@@ -13,6 +13,7 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from datetime import datetime
 import time
+from pyicloud.utils import get_localzone_name
 
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -315,8 +316,35 @@ class PyiCloudService:
         self._files = None
         self._photos = None
 
+    def _get_auth_retry_strategy(self):
+        """Get a retry strategy specifically for authentication."""
+        return Retry(
+            total=5,  # Increased total retries
+            backoff_factor=1.5,  # Exponential backoff
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST", "GET"],
+            respect_retry_after_header=True,
+            raise_on_status=False
+        )
+
+    def _setup_authentication_session(self):
+        """Set up session with proper retry handling for authentication."""
+        # Create an adapter with our custom retry strategy
+        adapter = HTTPAdapter(max_retries=self._get_auth_retry_strategy())
+        
+        # Mount it for both http and https
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        
+        # Set reasonable timeouts
+        self.session.timeout = (30, 90)  # (connect, read) timeouts in seconds
+
     def authenticate(self, force_refresh=False, service=None):
         """Authenticate or re-authenticate to iCloud."""
+        
+        # Set up authentication-specific session handling first
+        self._setup_authentication_session()
+        
         if force_refresh:
             LOGGER.debug("Forcing authentication refresh")
             self.session.cookies.clear()
@@ -329,7 +357,7 @@ class PyiCloudService:
                 'Referer': f"{self.HOME_ENDPOINT}/",
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)'
             })
-        
+
         login_successful = False
         if self.session_data.get("session_token") and not force_refresh:
             LOGGER.debug("Checking session token validity")
@@ -384,15 +412,19 @@ class PyiCloudService:
                         LOGGER.debug("Existing session validated successfully")
                     except:
                         LOGGER.debug("Session validation failed, proceeding with full login")
-                
+
                 if not login_successful:
                     LOGGER.debug("Performing full sign-in")
-                    self.session.post(
+                    
+                    # The retry logic is now handled by the session's retry strategy
+                    response = self.session.post(
                         "%s/signin" % self.AUTH_ENDPOINT,
                         params={"isRememberMeEnabled": "true"},
                         data=json.dumps(data),
                         headers=headers,
                     )
+                    
+                    response.raise_for_status()
                     self._authenticate_with_token()
                     LOGGER.debug("Full authentication completed successfully")
 
@@ -423,6 +455,10 @@ class PyiCloudService:
 
     def _authenticate_with_credentials_service(self, service):
         """Authenticate to a specific service using credentials."""
+        
+        # Set up authentication-specific session handling first
+        self._setup_authentication_session()
+        
         data = {
             "appName": service,
             "apple_id": self.user["accountName"],
@@ -431,20 +467,59 @@ class PyiCloudService:
         }
 
         # Add service-specific parameters
-        if service in ["calendar", "reminders"]:
+        if service == "reminders":
             data.update({
-                "clientBuildNumber": "2020Project52",
-                "clientMasteringNumber": "2020B29",
+                "clientBuildNumber": "2023Project70",
+                "clientMasteringNumber": "2023B70",
                 "clientId": self.client_id,
                 "dsid": self.data.get("dsInfo", {}).get("dsid"),
+                "remindersWebUIVersion": "2.0",
+                "usertz": get_localzone_name(),
+            })
+            
+            # Add iOS 13+ specific headers
+            self.session.headers.update({
+                "X-Apple-I-FD-Client-Info": "{\"app\":{\"name\":\"reminders\",\"version\":\"2.0\"}}",
+                "X-Apple-App-Version": "2.0",
+                "X-Apple-I-TimeZone": get_localzone_name(),
+                "X-Apple-I-ClientTime": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
 
         try:
-            self.session.post(
-                "%s/accountLogin" % self.SETUP_ENDPOINT, data=json.dumps(data)
+            # First try validating existing session
+            if self.session_data.get("session_token"):
+                try:
+                    self.data = self._validate_token()
+                    return
+                except PyiCloudAPIResponseException:
+                    LOGGER.debug("Session validation failed, proceeding with service auth")
+                    self.session_data.clear()
+                    self.session.cookies.clear()
+
+            # Perform service-specific authentication
+            # The retry logic is now handled by the session's retry strategy
+            response = self.session.post(
+                "%s/accountLogin" % self.SETUP_ENDPOINT,
+                data=json.dumps(data),
+                headers=self._get_auth_headers()
             )
 
-            self.data = self._validate_token()
+            self.data = response.json()
+
+            # Update session data
+            self.session_data.update({
+                "session_token": response.headers.get("X-Apple-Session-Token"),
+                "scnt": response.headers.get("scnt"),
+                "session_id": response.headers.get("X-Apple-ID-Session-Id"),
+            })
+
+            # Save session data
+            with open(self.session_path, "w", encoding="utf-8") as outfile:
+                json.dump(self.session_data, outfile)
+
+            # Save cookies
+            self.session.cookies.save(ignore_discard=True, ignore_expires=True)
+
         except PyiCloudAPIResponseException as error:
             msg = "Invalid email/password combination."
             raise PyiCloudFailedLoginException(msg, error) from error
@@ -452,7 +527,12 @@ class PyiCloudService:
     def _validate_token(self):
         """Checks if the current access token is still valid."""
         LOGGER.debug("Checking session token validity")
+        
+        # Set up authentication-specific session handling first
+        self._setup_authentication_session()
+        
         try:
+            # The retry logic is now handled by the session's retry strategy
             req = self.session.post("%s/validate" % self.SETUP_ENDPOINT, data="null")
             LOGGER.debug("Session token is still valid")
             return req.json()

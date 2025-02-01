@@ -5,12 +5,19 @@ import sys
 import json
 from os import path
 from tempfile import gettempdir
+import time
+import datetime
+import uuid
+import logging
+import tzlocal
 
 from .exceptions import PyiCloudNoStoredPasswordAvailableException
 
 
 KEYRING_SYSTEM = "pyicloud://icloud-password"
 TRUST_TOKEN_SYSTEM = "pyicloud://trust-token"
+
+LOGGER = logging.getLogger(__name__)
 
 
 def get_password(username, interactive=sys.stdout.isatty()):
@@ -126,3 +133,12 @@ def delete_trust_token(username, token_directory=None):
         remove(token_path)
     except FileNotFoundError:
         pass
+
+
+def get_localzone_name():
+    """Get the name of the local timezone."""
+    try:
+        return str(tzlocal.get_localzone())
+    except Exception as err:  # pylint: disable=broad-except
+        LOGGER.warning("Could not get local timezone: %s", err)
+        return "UTC"
