@@ -12,6 +12,7 @@ import getpass
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from datetime import datetime
+import time
 
 from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
@@ -66,14 +67,14 @@ class PyiCloudSession(Session):
         super().__init__()
         # Configure more robust retry strategy
         self.retry_strategy = Retry(
-            total=3,  # Increased from 2
-            connect=3,  # Increased retries for connection errors
-            read=3,    # Increased retries for read errors
-            backoff_factor=1.5,  # Increased backoff factor
+            total=5,  # Increased from 3
+            connect=5,  # Increased retries for connection errors
+            read=5,    # Increased retries for read errors
+            backoff_factor=2.0,  # Increased backoff factor for exponential backoff
             status_forcelist=[429, 500, 502, 503, 504],  # Added more error codes
             allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
             respect_retry_after_header=True,
-            raise_on_status=True
+            raise_on_status=False  # Don't raise immediately on status, let us handle it
         )
         self.mount('https://', HTTPAdapter(max_retries=self.retry_strategy))
         self._last_auth_time = None
@@ -117,6 +118,19 @@ class PyiCloudSession(Session):
                 
                 response = self.send(request)
                 request_logger.debug("Retried request after auth refresh, status: %d", response.status_code)
+            
+            # Handle 503 errors with exponential backoff
+            elif response.status_code == 503:
+                retry_after = int(response.headers.get('Retry-After', 5))
+                request_logger.warning("Got 503, waiting %d seconds before retry", retry_after)
+                time.sleep(retry_after)
+                
+                # Retry the request
+                request = response.request
+                if isinstance(request.body, bytes):
+                    request.body = request.body.decode('utf-8')
+                response = self.send(request)
+                request_logger.debug("Retried request after 503, status: %d", response.status_code)
 
             # Handle other response processing
             content_type = response.headers.get("Content-Type", "").split(";")[0]

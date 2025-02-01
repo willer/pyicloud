@@ -5,7 +5,7 @@ import uuid
 import json
 import logging
 from tzlocal import get_localzone_name
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 from collections import defaultdict
 from pyicloud.exceptions import PyiCloudException
 import pytz
@@ -13,8 +13,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 LOGGER = logging.getLogger(__name__)
 
+class Priority:
+    """Priority levels for reminders"""
+    NONE = 0
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+    URGENT = 4
+
+class RecurrenceType:
+    """Recurrence types for reminders"""
+    NONE = "none"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
+
 class RemindersService:
-    """The 'Reminders' iCloud service."""
+    """The 'Reminders' iCloud service with enhanced Chief of Staff features."""
 
     def __init__(self, service_root, session, params):
         self.session = session
@@ -24,13 +40,15 @@ class RemindersService:
         self._reminders_endpoint = "%s/rd" % self._service_root
         self._reminders_startup_url = "%s/startup" % self._reminders_endpoint
         self._reminders_tasks_url = "%s/reminders/tasks" % self._reminders_endpoint
-        self._max_retries = 2  # Reduced from 3
-        self._retry_delay = 2  # Increased from 1
+        self._max_retries = 3  # Increased from 2
+        self._retry_delay = 2
+        self._batch_size = 50  # Maximum number of reminders to process in a batch
         
-        # Initialize empty collections even before refresh
+        # Initialize empty collections
         self.lists = {}
         self.collections = {}
         self._reminders_by_guid = {}
+        self._tags = set()  # Track all unique tags
         
         # Add service-specific headers
         self.session.headers.update({
@@ -210,54 +228,71 @@ class RemindersService:
             return default_collection
         return collection_name
 
-    def post(self, title, description="", collection=None, **kwargs):
+    def post(self, title: str, description: str = "", collection: Optional[str] = None, 
+             priority: int = Priority.NONE, tags: List[str] = None, 
+             recurrence: Optional[str] = None, **kwargs) -> Optional[str]:
+        """Create a new reminder with enhanced features."""
         self._authenticate_before_request()
         collection = self._validate_collection(collection)
-        pguid = "tasks"
-        if collection:
-            if collection in self.collections:
-                pguid = self.collections[collection]["guid"]
+        pguid = self.collections[collection]["guid"] if collection in self.collections else "tasks"
 
-        due_dates = None
-        if kwargs.get("due_date"):
-            due_dates = [
-                int(str(kwargs["due_date"].year) + str(kwargs["due_date"].month) + str(kwargs["due_date"].day)),
-                kwargs["due_date"].year,
-                kwargs["due_date"].month,
-                kwargs["due_date"].day,
-                kwargs["due_date"].hour,
-                kwargs["due_date"].minute,
-            ]
+        # Format due date if provided
+        due_date = kwargs.get("due_date")
+        due_dates = self._format_due_date(due_date) if due_date else None
+
+        # Handle recurrence
+        recurrence_rule = self._format_recurrence(recurrence) if recurrence else None
 
         new_guid = str(uuid.uuid4())
-        data = {
-            "Reminders": {
+        reminder_data = {
+            "Reminder": {
+                "guid": new_guid,
                 "title": title,
                 "description": description,
                 "pGuid": pguid,
                 "etag": None,
                 "order": None,
-                "priority": 0,
-                "recurrence": None,
-                "alarms": [],
-                "startDate": None,
-                "startDateTz": None,
-                "startDateIsAllDay": False,
-                "completedDate": None,
-                "dueDate": due_dates,
+                "priority": priority,
+                "recurrence": recurrence_rule,
+                "createdDate": self._format_date(datetime.now()),
+                "lastModifiedDate": self._format_date(datetime.now()),
                 "dueDateIsAllDay": False,
-                "lastModifiedDate": None,
-                "createdDate": None,
-                "isFamily": None,
-                "createdDateExtended": int(time.time() * 1000),
-                "guid": new_guid,
-            },
-            "ClientState": {"Collections": list(self.collections.values())},
+                "tags": tags or [],
+                "completed": False,
+                "completedDate": None
+            }
         }
-        
-        response = self._make_request('post', "/rd/reminders/tasks", data=data)
-        if response and response.ok:
-            self.refresh()
+
+        if due_dates:
+            reminder_data["Reminder"].update(due_dates)
+
+        response = self._make_request(
+            "post",
+            "/rd/reminders/tasks",
+            data=reminder_data
+        )
+
+        if response and response.status_code == 200:
+            # Update local cache
+            reminder_data = {
+                "guid": new_guid,
+                "title": title,
+                "desc": description,
+                "due": due_date,
+                "completed": False,
+                "collection": collection,
+                "priority": priority,
+                "tags": tags or [],
+                "recurrence": recurrence,
+                "p_guid": pguid,
+            }
+            self._reminders_by_guid[new_guid] = reminder_data
+            self.lists[collection].append(reminder_data)
+            
+            # Update tags set
+            if tags:
+                self._tags.update(tags)
+            
             return new_guid
         return None
 
@@ -265,116 +300,75 @@ class RemindersService:
         """Get a reminder by its GUID."""
         return self._reminders_by_guid.get(guid)
 
-    def update(self, guid, title=None, description=None, due_date=None, collection=None):
-        """Update an existing reminder."""
-        reminder = self._reminders_by_guid.get(guid)
-        if not reminder:
-            LOGGER.error("Cannot update reminder %s: not found", guid)
+    def update(self, guid: str, title: Optional[str] = None, 
+               description: Optional[str] = None, due_date: Optional[datetime] = None,
+               collection: Optional[str] = None, priority: Optional[int] = None,
+               tags: Optional[List[str]] = None, recurrence: Optional[str] = None) -> bool:
+        """Update a reminder with enhanced features."""
+        if guid not in self._reminders_by_guid:
             return False
+
+        current = self._reminders_by_guid[guid]
+        pguid = current["p_guid"]
+        
+        if collection:
+            collection = self._validate_collection(collection)
+            if collection in self.collections:
+                pguid = self.collections[collection]["guid"]
 
         # Format due date if provided
-        due_dates = None
-        if due_date:
-            due_dates = [
-                int(str(due_date.year) + str(due_date.month) + str(due_date.day)),
-                due_date.year,
-                due_date.month,
-                due_date.day,
-                due_date.hour,
-                due_date.minute,
-            ]
-        elif reminder.get("due"):
-            due = reminder["due"]
-            due_dates = [
-                int(str(due.year) + str(due.month) + str(due.day)),
-                due.year,
-                due.month,
-                due.day,
-                due.hour,
-                due.minute,
-            ]
+        due_dates = self._format_due_date(due_date) if due_date is not None else None
+        
+        # Handle recurrence
+        recurrence_rule = self._format_recurrence(recurrence) if recurrence else None
 
-        # Get target collection GUID
-        target_pguid = reminder["p_guid"]
-        if collection and collection in self.collections:
-            target_pguid = self.collections[collection]["guid"]
-
-        # Create update data
-        data = {
-            "Reminders": [{
+        reminder_data = {
+            "Reminder": {
                 "guid": guid,
-                "title": title if title is not None else reminder["title"],
-                "description": description if description is not None else reminder.get("desc", ""),
-                "pGuid": target_pguid,
-                "etag": reminder.get("etag"),
-                "order": None,
-                "priority": 0,
-                "recurrence": None,
-                "alarms": [],
-                "startDate": None,
-                "startDateTz": None,
-                "startDateIsAllDay": False,
-                "completedDate": None,
-                "dueDate": due_dates,
-                "dueDateIsAllDay": False,
-                "lastModifiedDate": int(time.time() * 1000),
-                "createdDateExtended": int(time.time() * 1000),
-            }],
-            "ClientState": {"Collections": list(self.collections.values())},
+                "pGuid": pguid,
+                "title": title if title is not None else current["title"],
+                "description": description if description is not None else current.get("desc", ""),
+                "priority": priority if priority is not None else current.get("priority", Priority.NONE),
+                "tags": tags if tags is not None else current.get("tags", []),
+                "recurrence": recurrence_rule,
+                "lastModifiedDate": self._format_date(datetime.now()),
+            }
         }
 
-        # Update request parameters
-        params = dict(self.params)
-        params.update({
-            "lang": "en-us",
-            "usertz": get_localzone_name(),
-        })
+        if due_dates:
+            reminder_data["Reminder"].update(due_dates)
 
-        response = self.session.post(
-            self._reminders_tasks_url,
-            data=json.dumps(data),
-            params=params
+        response = self._make_request(
+            "post",
+            f"/rd/reminders/tasks/{guid}",
+            data=reminder_data
         )
 
-        if response.ok:
-            # Add a small delay to allow server to process the update
-            time.sleep(1)
+        if response and response.status_code == 200:
+            # Update local cache
+            current.update({
+                "title": reminder_data["Reminder"]["title"],
+                "desc": reminder_data["Reminder"]["description"],
+                "due": due_date if due_date is not None else current.get("due"),
+                "priority": reminder_data["Reminder"]["priority"],
+                "tags": reminder_data["Reminder"]["tags"],
+                "recurrence": recurrence,
+                "p_guid": pguid,
+            })
             
-            # Refresh to get latest state
-            self.refresh()
+            # Update collection if changed
+            if collection and collection != current["collection"]:
+                old_collection = current["collection"]
+                self.lists[old_collection].remove(current)
+                self.lists[collection].append(current)
+                current["collection"] = collection
             
-            # Verify the update was successful
-            updated_reminder = self._reminders_by_guid.get(guid)
-            if not updated_reminder:
-                LOGGER.error("Failed to find reminder %s after update", guid)
-                return False
-                
-            # Check title if it was updated
-            if title is not None and updated_reminder["title"] != title:
-                LOGGER.error("Title mismatch after update. Expected: %s, Got: %s", 
-                            title, updated_reminder["title"])
-                return False
-                
-            # Check description if it was updated
-            if description is not None and updated_reminder.get("desc") != description:
-                LOGGER.error("Description mismatch after update. Expected: %s, Got: %s",
-                            description, updated_reminder.get("desc"))
-                return False
-                
-            # Check due date if it was updated
-            if due_date is not None and updated_reminder.get("due"):
-                # Compare only date components to avoid timezone issues
-                expected_date = due_date.date()
-                actual_date = updated_reminder["due"].date()
-                if expected_date != actual_date:
-                    LOGGER.error("Due date mismatch after update. Expected: %s, Got: %s",
-                                expected_date, actual_date)
-                    return False
-                                
+            # Update tags set
+            if tags:
+                self._tags.update(tags)
+            
             return True
-        else:
-            LOGGER.error("Update request failed for reminder %s: %s", guid, response.text)
-            return False
+        return False
 
     def complete(self, guid):
         """Mark a reminder as completed."""
@@ -550,3 +544,54 @@ class RemindersService:
             due_date = local_tz.localize(due_date)
             
         return due_date.astimezone(pytz.utc).isoformat(timespec='seconds')
+
+    def get_reminders_by_priority(self, min_priority: int = Priority.NONE,
+                                include_completed: bool = False) -> List[Dict]:
+        """Get reminders filtered by minimum priority level."""
+        reminders = []
+        for collection in self.lists.values():
+            for reminder in collection:
+                if (reminder.get("priority", Priority.NONE) >= min_priority and
+                    (include_completed or not reminder["completed"])):
+                    reminders.append(reminder)
+        return sorted(reminders, key=lambda x: (-x.get("priority", Priority.NONE),
+                                              x.get("due") or datetime.max))
+
+    def get_reminders_by_tags(self, tags: List[str], match_all: bool = False,
+                            include_completed: bool = False) -> List[Dict]:
+        """Get reminders that match specified tags."""
+        reminders = []
+        tags = set(tags)
+        for collection in self.lists.values():
+            for reminder in collection:
+                reminder_tags = set(reminder.get("tags", []))
+                if ((match_all and tags.issubset(reminder_tags)) or
+                    (not match_all and tags.intersection(reminder_tags)) and
+                    (include_completed or not reminder["completed"])):
+                    reminders.append(reminder)
+        return reminders
+
+    def get_all_tags(self) -> List[str]:
+        """Get all unique tags used across reminders."""
+        return sorted(list(self._tags))
+
+    def _format_recurrence(self, recurrence_type: str) -> Optional[Dict]:
+        """Format recurrence rule for a reminder."""
+        if not recurrence_type or recurrence_type == RecurrenceType.NONE:
+            return None
+            
+        recurrence_rules = {
+            RecurrenceType.DAILY: {"freq": "DAILY"},
+            RecurrenceType.WEEKLY: {"freq": "WEEKLY"},
+            RecurrenceType.MONTHLY: {"freq": "MONTHLY"},
+            RecurrenceType.YEARLY: {"freq": "YEARLY"}
+        }
+        
+        return recurrence_rules.get(recurrence_type)
+
+    def _format_date(self, date: datetime) -> List:
+        """Format a datetime object for the API."""
+        if not date:
+            return None
+        return [0, date.year, date.month, date.day,
+                date.hour, date.minute, date.second]
