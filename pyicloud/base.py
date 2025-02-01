@@ -65,16 +65,16 @@ class PyiCloudSession(Session):
     def __init__(self, service):
         self.service = service
         super().__init__()
-        # Configure more robust retry strategy
+        # Configure more efficient retry strategy
         self.retry_strategy = Retry(
-            total=5,  # Increased from 3
-            connect=5,  # Increased retries for connection errors
-            read=5,    # Increased retries for read errors
-            backoff_factor=2.0,  # Increased backoff factor for exponential backoff
-            status_forcelist=[429, 500, 502, 503, 504],  # Added more error codes
+            total=2,  # Reduced from 5
+            connect=2,  # Reduced from 5
+            read=2,    # Reduced from 5
+            backoff_factor=0.5,  # Reduced from 2.0
+            status_forcelist=[429, 503, 504],  # Removed 500, 502 as they're handled separately
             allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
             respect_retry_after_header=True,
-            raise_on_status=False  # Don't raise immediately on status, let us handle it
+            raise_on_status=True  # Changed to True to handle errors in request method
         )
         self.mount('https://', HTTPAdapter(max_retries=self.retry_strategy))
         self._last_auth_time = None
@@ -98,7 +98,7 @@ class PyiCloudSession(Session):
             if (response.status_code in (450, 500) and 'Authentication required' in response.text) or \
                (response.status_code == 401) or \
                (response.status_code == 403):
-                request_logger.debug("Got auth error %d, attempting refresh", response.status_code)
+                request_logger.debug("Got auth error %d, attempting single refresh", response.status_code)
                 
                 # Clear existing tokens and cookies
                 self.cookies.clear()
@@ -108,7 +108,7 @@ class PyiCloudSession(Session):
                 self.service.authenticate(True)
                 self._last_auth_time = datetime.now()
                 
-                # Retry the request with fresh auth
+                # Retry the request once with fresh auth
                 request = response.request
                 if isinstance(request.body, bytes):
                     request.body = request.body.decode('utf-8')
@@ -118,14 +118,18 @@ class PyiCloudSession(Session):
                 
                 response = self.send(request)
                 request_logger.debug("Retried request after auth refresh, status: %d", response.status_code)
+                
+                # If still failing after refresh, raise error
+                if response.status_code >= 400:
+                    self._raise_error(response.status_code, response.reason)
             
-            # Handle 503 errors with exponential backoff
+            # Handle 503 errors with minimal backoff
             elif response.status_code == 503:
-                retry_after = int(response.headers.get('Retry-After', 5))
+                retry_after = min(int(response.headers.get('Retry-After', 2)), 5)  # Cap at 5 seconds
                 request_logger.warning("Got 503, waiting %d seconds before retry", retry_after)
                 time.sleep(retry_after)
                 
-                # Retry the request
+                # Retry the request once
                 request = response.request
                 if isinstance(request.body, bytes):
                     request.body = request.body.decode('utf-8')

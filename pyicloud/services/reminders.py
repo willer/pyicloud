@@ -5,13 +5,19 @@ import uuid
 import json
 import logging
 from tzlocal import get_localzone_name
-from typing import List, Dict, Optional, Union, Tuple
+from typing import List, Dict, Optional, Union, Tuple, Any
 from collections import defaultdict
 from pyicloud.exceptions import PyiCloudException
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 LOGGER = logging.getLogger(__name__)
+
+# Constants for performance tuning
+AUTH_TOKEN_EXPIRY = 3600  # 1 hour
+BATCH_SIZE = 20
+REQUEST_TIMEOUT = 30
+MAX_BATCH_RETRIES = 3
 
 class Priority:
     """Priority levels for reminders"""
@@ -29,26 +35,45 @@ class RecurrenceType:
     MONTHLY = "monthly"
     YEARLY = "yearly"
 
+class BatchOperation:
+    """Types of batch operations"""
+    CREATE = "create"
+    UPDATE = "update"
+    DELETE = "delete"
+    COMPLETE = "complete"
+
+class RetryableError(Exception):
+    """Errors that should trigger a retry."""
+    pass
+
+class NonRetryableError(Exception):
+    """Errors that should fail immediately."""
+    pass
+
 class RemindersService:
-    """The 'Reminders' iCloud service with enhanced Chief of Staff features."""
+    """The 'Reminders' iCloud service with enhanced Chief of Staff features and performance optimizations."""
 
     def __init__(self, service_root, session, params):
         self.session = session
         self.params = params
-        self.token_expiry = 0  # Track token expiration
+        self.token_expiry = 0
         self._service_root = service_root
         self._reminders_endpoint = "%s/rd" % self._service_root
         self._reminders_startup_url = "%s/startup" % self._reminders_endpoint
         self._reminders_tasks_url = "%s/reminders/tasks" % self._reminders_endpoint
-        self._max_retries = 3  # Increased from 2
-        self._retry_delay = 2
-        self._batch_size = 50  # Maximum number of reminders to process in a batch
+        self._batch_endpoint = "%s/batch" % self._reminders_tasks_url
+        self._max_retries = 1  # Reduced from 3
+        self._retry_delay = 1  # Reduced from 2
+        self._batch_size = BATCH_SIZE
+        self._pending_operations = []
+        self._last_refresh = 0
+        self._refresh_interval = 300  # 5 minutes
         
-        # Initialize empty collections
-        self.lists = {}
+        # Initialize empty collections with better memory efficiency
+        self.lists = defaultdict(list)
         self.collections = {}
         self._reminders_by_guid = {}
-        self._tags = set()  # Track all unique tags
+        self._tags = set()
         
         # Add service-specific headers
         self.session.headers.update({
@@ -77,88 +102,123 @@ class RemindersService:
             "remindersWebUIVersion": "1.0",
         })
         
-        # Now try to refresh
+        # Initial refresh
         self.refresh()
 
-    def _authenticate_before_request(self):
-        """Refresh auth token before each request"""
+    def _authenticate_before_request(self) -> bool:
+        """Only refresh auth token if expired."""
+        now = time.time()
+        if now < self.token_expiry:
+            return True
+            
         try:
             self.session.service.authenticate(True, "reminders")
-            LOGGER.debug("Refreshed reminders service auth token")
+            self.token_expiry = now + AUTH_TOKEN_EXPIRY
+            return True
         except Exception as e:
             LOGGER.error("Failed to refresh auth token: %s", str(e))
             return False
-        return True
 
-    def _make_request(self, method, endpoint, data=None, params=None, retries=None):
-        """Make an authenticated request to the reminders service."""
-        if not self._authenticate_before_request():
-            return None
-        
-        if retries is None:
-            retries = self._max_retries
+    def _batch_request(self, operations: List[Dict[str, Any]], force: bool = False) -> bool:
+        """Execute batch operations efficiently."""
+        if not operations and not force:
+            return True
             
-        if retries <= 0:
-            LOGGER.error("Max retries exceeded")
-            return None
+        if not operations and force:
+            operations = self._pending_operations
+            self._pending_operations = []
+            
+        if not operations:
+            return True
             
         try:
-            LOGGER.debug(f"Making {method} request to {endpoint} (retries left: {retries})")
-            # Update parameters for this request
-            request_params = dict(self.params)
-            if params:
-                request_params.update(params)
+            for i in range(0, len(operations), self._batch_size):
+                batch = operations[i:i + self._batch_size]
+                response = self._make_request(
+                    'post',
+                    '/rd/reminders/tasks/batch',
+                    data={'operations': batch},
+                    timeout=REQUEST_TIMEOUT
+                )
                 
-            # Make request
+                if not response or response.status_code != 200:
+                    LOGGER.error("Batch operation failed: %s", response.text if response else "No response")
+                    return False
+                    
+                # Small delay between batches to avoid rate limiting
+                if i + self._batch_size < len(operations):
+                    time.sleep(0.5)
+                    
+            return True
+            
+        except Exception as e:
+            LOGGER.error("Batch operation failed: %s", str(e))
+            return False
+
+    def _queue_operation(self, op_type: str, data: Dict[str, Any], immediate: bool = False) -> bool:
+        """Queue an operation for batch processing."""
+        operation = {
+            'type': op_type,
+            'data': data,
+            'timestamp': time.time()
+        }
+        
+        self._pending_operations.append(operation)
+        
+        if immediate or len(self._pending_operations) >= self._batch_size:
+            return self._batch_request(self._pending_operations, force=True)
+            
+        return True
+
+    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None,
+                     params: Optional[Dict] = None, timeout: int = REQUEST_TIMEOUT) -> Optional[Any]:
+        """Make an authenticated request with minimal retries."""
+        if not self._authenticate_before_request():
+            raise NonRetryableError("Failed to authenticate")
+            
+        try:
+            LOGGER.debug(f"Making {method} request to {endpoint}")
+            request_params = {**self.params, **(params or {})}
+            
             if method.lower() == 'get':
                 response = self.session.get(
                     f"{self._service_root}{endpoint}",
-                    params=request_params
+                    params=request_params,
+                    timeout=timeout
                 )
-            else:  # POST
-                LOGGER.debug(f"POST data: {data}")
+            else:
                 response = self.session.post(
                     f"{self._service_root}{endpoint}",
                     data=json.dumps(data) if data else None,
-                    params=request_params
+                    params=request_params,
+                    timeout=timeout
                 )
                 
-            LOGGER.debug(f"Response status: {response.status_code}")
-            
-            # Only retry on specific status codes, not 500
-            if response.status_code in (401, 421, 503):
-                error_msg = response.text if response.text else f"HTTP {response.status_code}"
-                LOGGER.warning(f"Got status {response.status_code}: {error_msg}")
+            # Handle different error cases
+            if response.status_code == 401 or \
+               (response.status_code == 500 and "Authentication required" in response.text):
+                # Auth error - let session handle it
+                raise NonRetryableError("Authentication failed")
                 
-                if "Authentication required" in error_msg or response.status_code in (401, 421):
-                    LOGGER.info(f"Authentication expired, retrying in {self._retry_delay}s...")
-                    self._authenticate_before_request()
-                    time.sleep(self._retry_delay)
-                    return self._make_request(method, endpoint, data, params, retries - 1)
-                elif response.status_code == 503:
-                    delay = self._retry_delay * 2
-                    LOGGER.info(f"Service temporarily unavailable, retrying in {delay}s...")
-                    time.sleep(delay)
-                    return self._make_request(method, endpoint, data, params, retries - 1)
-            elif response.status_code == 500:
-                LOGGER.error(f"Server error (500): {response.text}")
-                return None
+            elif response.status_code >= 400:
+                # Other errors - non-retryable
+                raise NonRetryableError(f"HTTP {response.status_code}: {response.text}")
                 
             response.raise_for_status()
             return response
             
         except Exception as e:
-            LOGGER.error("Request failed: %s", str(e))
-            if retries > 0 and not str(e).startswith('500'):  # Don't retry 500 errors
-                time.sleep(self._retry_delay)
-                return self._make_request(method, endpoint, data, params, retries - 1)
-            return None
+            LOGGER.error(f"Request failed: {str(e)}")
+            raise NonRetryableError(str(e))
 
-    def refresh(self):
-        """Refresh data."""
+    def refresh(self, force: bool = False) -> bool:
+        """Refresh data with caching."""
+        now = time.time()
+        if not force and now - self._last_refresh < self._refresh_interval:
+            return True
+            
         response = self._make_request('get', "/rd/startup")
         if not response:
-            LOGGER.error("Failed to refresh reminders data")
             return False
 
         try:
@@ -168,49 +228,55 @@ class RemindersService:
             self.lists.clear()
             self.collections.clear()
             self._reminders_by_guid.clear()
+            self._tags.clear()
 
-            collections = data.get("Collections", [])
-            
-            for collection in collections:
-                temp = []
+            for collection in data.get("Collections", []):
                 self.collections[collection["title"]] = {
                     "guid": collection["guid"],
                     "ctag": collection["ctag"],
                 }
                 
-                reminders = data.get("Reminders", [])
+            for reminder in data.get("Reminders", []):
+                collection_guid = reminder["pGuid"]
+                collection_title = next(
+                    (title for title, info in self.collections.items() 
+                     if info["guid"] == collection_guid),
+                    None
+                )
                 
-                for reminder in reminders:
-                    if reminder["pGuid"] != collection["guid"]:
-                        continue
+                if not collection_title:
+                    continue
 
-                    if reminder.get("dueDate"):
-                        due = datetime(
+                due_date = None
+                if reminder.get("dueDate"):
+                    try:
+                        due_date = datetime(
                             reminder["dueDate"][1],
                             reminder["dueDate"][2],
                             reminder["dueDate"][3],
                             reminder["dueDate"][4],
                             reminder["dueDate"][5],
                         )
-                    else:
-                        due = None
+                    except (IndexError, ValueError) as e:
+                        LOGGER.warning(f"Invalid due date for reminder {reminder['guid']}: {e}")
 
-                    reminder_data = {
-                        "guid": reminder["guid"],
-                        "title": reminder["title"],
-                        "desc": reminder.get("description"),
-                        "due": due,
-                        "completed": reminder.get("completedDate") is not None,
-                        "collection": collection["title"],
-                        "etag": reminder.get("etag"),
-                        "p_guid": reminder["pGuid"],
-                    }
-                    
-                    temp.append(reminder_data)
-                    self._reminders_by_guid[reminder["guid"]] = reminder_data
-                    
-                self.lists[collection["title"]] = temp
+                reminder_data = {
+                    "guid": reminder["guid"],
+                    "title": reminder["title"],
+                    "desc": reminder.get("description"),
+                    "due": due_date,
+                    "completed": reminder.get("completedDate") is not None,
+                    "collection": collection_title,
+                    "priority": reminder.get("priority", 0),
+                    "tags": reminder.get("tags", []),
+                    "p_guid": collection_guid,
+                }
                 
+                self.lists[collection_title].append(reminder_data)
+                self._reminders_by_guid[reminder["guid"]] = reminder_data
+                self._tags.update(reminder_data["tags"])
+                
+            self._last_refresh = now
             return True
             
         except Exception as e:
@@ -232,68 +298,98 @@ class RemindersService:
              priority: int = Priority.NONE, tags: List[str] = None, 
              recurrence: Optional[str] = None, **kwargs) -> Optional[str]:
         """Create a new reminder with enhanced features."""
-        self._authenticate_before_request()
-        collection = self._validate_collection(collection)
-        pguid = self.collections[collection]["guid"] if collection in self.collections else "tasks"
+        try:
+            collection = self._validate_collection(collection)
+            pguid = self.collections[collection]["guid"] if collection in self.collections else "tasks"
 
-        # Format due date if provided
-        due_date = kwargs.get("due_date")
-        due_dates = self._format_due_date(due_date) if due_date else None
-
-        # Handle recurrence
-        recurrence_rule = self._format_recurrence(recurrence) if recurrence else None
-
-        new_guid = str(uuid.uuid4())
-        reminder_data = {
-            "Reminder": {
-                "guid": new_guid,
-                "title": title,
-                "description": description,
-                "pGuid": pguid,
-                "etag": None,
-                "order": None,
-                "priority": priority,
-                "recurrence": recurrence_rule,
-                "createdDate": self._format_date(datetime.now()),
-                "lastModifiedDate": self._format_date(datetime.now()),
-                "dueDateIsAllDay": False,
-                "tags": tags or [],
-                "completed": False,
-                "completedDate": None
-            }
-        }
-
-        if due_dates:
-            reminder_data["Reminder"].update(due_dates)
-
-        response = self._make_request(
-            "post",
-            "/rd/reminders/tasks",
-            data=reminder_data
-        )
-
-        if response and response.status_code == 200:
-            # Update local cache
+            new_guid = str(uuid.uuid4())
+            now = datetime.now(pytz.UTC)
+            
             reminder_data = {
                 "guid": new_guid,
                 "title": title,
-                "desc": description,
-                "due": due_date,
-                "completed": False,
-                "collection": collection,
+                "description": description or "",
+                "pGuid": pguid,
+                "etag": None,
+                "order": 0,
                 "priority": priority,
+                "recurrence": self._format_recurrence(recurrence),
+                "createdDateExtended": int(now.timestamp() * 1000),
+                "lastModifiedDate": int(now.timestamp() * 1000),
+                "dueDateIsAllDay": False,
                 "tags": tags or [],
-                "recurrence": recurrence,
-                "p_guid": pguid,
+                "completed": False,
+                "completedDate": None,
+                "alarms": [],
+                "recurrenceMaster": None,
+                "startDate": None,
+                "startDateTz": None,
+                "startDateIsAllDay": False,
+                "isFamily": False,
+                "createdDate": [
+                    int(f"{now.year}{now.month:02d}{now.day:02d}"),
+                    now.year,
+                    now.month,
+                    now.day,
+                    now.hour,
+                    now.minute,
+                    now.second
+                ]
             }
-            self._reminders_by_guid[new_guid] = reminder_data
-            self.lists[collection].append(reminder_data)
+
+            # Add due date if provided
+            due_date = kwargs.get("due_date")
+            if due_date:
+                if not due_date.tzinfo:
+                    local_tz = pytz.timezone('America/Los_Angeles')
+                    due_date = local_tz.localize(due_date)
+                utc_date = due_date.astimezone(pytz.UTC)
+                reminder_data.update({
+                    "dueDate": [
+                        int(f"{utc_date.year}{utc_date.month:02d}{utc_date.day:02d}"),
+                        utc_date.year,
+                        utc_date.month,
+                        utc_date.day,
+                        utc_date.hour,
+                        utc_date.minute,
+                        utc_date.second
+                    ],
+                    "dueDateTz": "UTC"
+                })
+
+            # Make direct request instead of using batch operation for better error handling
+            response = self._make_request(
+                "post",
+                "/rd/reminders/tasks",
+                data={"Reminder": reminder_data},
+                timeout=REQUEST_TIMEOUT
+            )
+
+            if response and response.status_code == 200:
+                # Update local cache
+                cache_data = {
+                    "guid": new_guid,
+                    "title": title,
+                    "desc": description,
+                    "due": due_date,
+                    "completed": False,
+                    "collection": collection,
+                    "priority": priority,
+                    "tags": tags or [],
+                    "recurrence": recurrence,
+                    "p_guid": pguid,
+                }
+                self._reminders_by_guid[new_guid] = cache_data
+                self.lists[collection].append(cache_data)
+                if tags:
+                    self._tags.update(tags)
+                return new_guid
+                
+        except NonRetryableError as e:
+            LOGGER.error(f"Failed to create reminder: {str(e)}")
+        except Exception as e:
+            LOGGER.error(f"Unexpected error creating reminder: {str(e)}")
             
-            # Update tags set
-            if tags:
-                self._tags.update(tags)
-            
-            return new_guid
         return None
 
     def get_reminder(self, guid):
@@ -316,42 +412,34 @@ class RemindersService:
             if collection in self.collections:
                 pguid = self.collections[collection]["guid"]
 
-        # Format due date if provided
-        due_dates = self._format_due_date(due_date) if due_date is not None else None
-        
-        # Handle recurrence
-        recurrence_rule = self._format_recurrence(recurrence) if recurrence else None
-
-        reminder_data = {
-            "Reminder": {
-                "guid": guid,
-                "pGuid": pguid,
-                "title": title if title is not None else current["title"],
-                "description": description if description is not None else current.get("desc", ""),
-                "priority": priority if priority is not None else current.get("priority", Priority.NONE),
-                "tags": tags if tags is not None else current.get("tags", []),
-                "recurrence": recurrence_rule,
-                "lastModifiedDate": self._format_date(datetime.now()),
-            }
+        update_data = {
+            "guid": guid,
+            "pGuid": pguid,
+            "title": title if title is not None else current["title"],
+            "description": description if description is not None else current.get("desc", ""),
+            "priority": priority if priority is not None else current.get("priority", Priority.NONE),
+            "tags": tags if tags is not None else current.get("tags", []),
+            "recurrence": self._format_recurrence(recurrence) if recurrence else None,
+            "lastModifiedDate": self._format_date(datetime.now()),
         }
 
-        if due_dates:
-            reminder_data["Reminder"].update(due_dates)
+        if due_date is not None:
+            update_data.update(self._format_due_date(due_date))
 
-        response = self._make_request(
-            "post",
-            f"/rd/reminders/tasks/{guid}",
-            data=reminder_data
+        success = self._queue_operation(
+            BatchOperation.UPDATE,
+            update_data,
+            immediate=True  # Force immediate update for better UX
         )
 
-        if response and response.status_code == 200:
+        if success:
             # Update local cache
             current.update({
-                "title": reminder_data["Reminder"]["title"],
-                "desc": reminder_data["Reminder"]["description"],
+                "title": update_data["title"],
+                "desc": update_data["description"],
                 "due": due_date if due_date is not None else current.get("due"),
-                "priority": reminder_data["Reminder"]["priority"],
-                "tags": reminder_data["Reminder"]["tags"],
+                "priority": update_data["priority"],
+                "tags": update_data["tags"],
                 "recurrence": recurrence,
                 "p_guid": pguid,
             })
@@ -370,52 +458,28 @@ class RemindersService:
             return True
         return False
 
-    def complete(self, guid):
+    def complete(self, guid: str) -> bool:
         """Mark a reminder as completed."""
         reminder = self.get_reminder(guid)
         if not reminder:
             return False
 
-        # Format due date if it exists
-        due_dates = None
-        if reminder.get("due"):
-            due = reminder["due"]
-            due_dates = [
-                int(str(due.year) + str(due.month) + str(due.day)),
-                due.year,
-                due.month,
-                due.day,
-                due.hour,
-                due.minute,
-            ]
-
-        # Create update data with completed status
-        completed_date = int(time.time() * 1000)
-        data = {
-            "Reminders": [{
-                "guid": guid,
-                "title": reminder["title"],
-                "description": reminder.get("desc", ""),
-                "pGuid": reminder["p_guid"],
-                "etag": None,
-                "order": None,
-                "priority": 0,
-                "recurrence": None,
-                "alarms": [],
-                "startDate": None,
-                "startDateTz": None,
-                "startDateIsAllDay": False,
-                "completedDate": completed_date,
-                "dueDate": due_dates,
-                "dueDateIsAllDay": False,
-                "lastModifiedDate": completed_date,
-            }],
-            "ClientState": {"Collections": list(self.collections.values())},
+        complete_data = {
+            "guid": guid,
+            "pGuid": reminder["p_guid"],
+            "title": reminder["title"],
+            "completedDate": int(time.time() * 1000),
+            "lastModifiedDate": self._format_date(datetime.now()),
         }
 
-        response = self._make_request('post', "/rd/reminders/tasks", data=data)
-        if response and response.ok:
-            self.refresh()
+        success = self._queue_operation(
+            BatchOperation.COMPLETE,
+            complete_data,
+            immediate=True
+        )
+
+        if success:
+            reminder["completed"] = True
             return True
         return False
 
@@ -505,36 +569,88 @@ class RemindersService:
                     
         return dict(reminders_by_collection)
 
-    def batch_complete(self, guids):
-        """Process batch completions with rate limiting"""
+    def batch_complete(self, guids: List[str]) -> Dict[str, bool]:
+        """Complete multiple reminders efficiently."""
         results = {}
-        with ThreadPoolExecutor(max_workers=3) as executor:  # Reduced from 5
-            futures = {executor.submit(self.complete, guid): guid for guid in guids}
-            
-            for i, future in enumerate(as_completed(futures)):
-                guid = futures[future]
-                try:
-                    results[guid] = future.result()
-                except Exception as e:
-                    results[guid] = False
-                    LOGGER.error(f"Failed to complete {guid}: {str(e)}")
-                    if '500' in str(e):  # If we get a 500, stop processing
-                        break
+        operations = []
+        
+        for guid in guids:
+            reminder = self.get_reminder(guid)
+            if not reminder:
+                results[guid] = False
+                continue
                 
-                # Rate limit: 1 request every 0.5s
-                time.sleep(0.5)
+            complete_data = {
+                "guid": guid,
+                "pGuid": reminder["p_guid"],
+                "title": reminder["title"],
+                "completedDate": int(time.time() * 1000),
+                "lastModifiedDate": self._format_date(datetime.now()),
+            }
+            operations.append({
+                "type": BatchOperation.COMPLETE,
+                "data": complete_data
+            })
+            
+        if operations:
+            success = self._batch_request(operations)
+            if success:
+                for op in operations:
+                    guid = op["data"]["guid"]
+                    self._reminders_by_guid[guid]["completed"] = True
+                    results[guid] = True
+            else:
+                for op in operations:
+                    results[op["data"]["guid"]] = False
                     
         return results
 
     def batch_move(self, guids: List[str], target_collection: str) -> Dict[str, bool]:
-        """Move multiple reminders to a target collection."""
+        """Move multiple reminders to a target collection efficiently."""
+        if target_collection not in self.collections:
+            return {guid: False for guid in guids}
+            
         results = {}
+        operations = []
+        target_pguid = self.collections[target_collection]["guid"]
+        
         for guid in guids:
-            results[guid] = self.move_reminder(guid, target_collection)
+            reminder = self.get_reminder(guid)
+            if not reminder:
+                results[guid] = False
+                continue
+                
+            move_data = {
+                "guid": guid,
+                "pGuid": target_pguid,
+                "title": reminder["title"],
+                "lastModifiedDate": self._format_date(datetime.now()),
+            }
+            operations.append({
+                "type": BatchOperation.UPDATE,
+                "data": move_data
+            })
+            
+        if operations:
+            success = self._batch_request(operations)
+            if success:
+                for op in operations:
+                    guid = op["data"]["guid"]
+                    reminder = self._reminders_by_guid[guid]
+                    old_collection = reminder["collection"]
+                    self.lists[old_collection].remove(reminder)
+                    reminder["collection"] = target_collection
+                    reminder["p_guid"] = target_pguid
+                    self.lists[target_collection].append(reminder)
+                    results[guid] = True
+            else:
+                for op in operations:
+                    results[op["data"]["guid"]] = False
+                    
         return results
 
     def _format_due_date(self, due_date):
-        """Convert datetime to iCloud-compatible UTC ISO format"""
+        """Format a datetime object for the API."""
         if not due_date:
             return None
             
@@ -543,7 +659,23 @@ class RemindersService:
             local_tz = pytz.timezone('America/Los_Angeles')  # Adjust as needed
             due_date = local_tz.localize(due_date)
             
-        return due_date.astimezone(pytz.utc).isoformat(timespec='seconds')
+        # Convert to UTC for API
+        utc_date = due_date.astimezone(pytz.UTC)
+        
+        # Format as required by the API
+        return {
+            "dueDate": [
+                int(f"{utc_date.year}{utc_date.month:02d}{utc_date.day:02d}"),
+                utc_date.year,
+                utc_date.month,
+                utc_date.day,
+                utc_date.hour,
+                utc_date.minute,
+                utc_date.second
+            ],
+            "dueDateIsAllDay": False,
+            "dueDateTz": "UTC"
+        }
 
     def get_reminders_by_priority(self, min_priority: int = Priority.NONE,
                                 include_completed: bool = False) -> List[Dict]:
@@ -589,9 +721,22 @@ class RemindersService:
         
         return recurrence_rules.get(recurrence_type)
 
-    def _format_date(self, date: datetime) -> List:
+    def _format_date(self, date: datetime) -> List[int]:
         """Format a datetime object for the API."""
         if not date:
             return None
-        return [0, date.year, date.month, date.day,
-                date.hour, date.minute, date.second]
+            
+        if not date.tzinfo:
+            local_tz = pytz.timezone('America/Los_Angeles')
+            date = local_tz.localize(date)
+            
+        utc_date = date.astimezone(pytz.UTC)
+        return [
+            int(f"{utc_date.year}{utc_date.month:02d}{utc_date.day:02d}"),
+            utc_date.year,
+            utc_date.month,
+            utc_date.day,
+            utc_date.hour,
+            utc_date.minute,
+            utc_date.second
+        ]

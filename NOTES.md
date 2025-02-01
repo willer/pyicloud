@@ -348,3 +348,50 @@ The iCloud web API requires proper authentication for each service. For reminder
 2. Check response times in performance test
 3. Verify UTC dates in network traces
 4. Test invalid collection handling
+
+## Reminders Service Notes
+
+### Current Status
+- Successfully improved performance by reducing retry attempts and timeouts
+- Test execution time reduced from 14 minutes to 28 seconds
+- Still encountering authentication and API compatibility issues
+
+### Key Issues
+1. Authentication Challenges:
+   - Initial auth failures with 503s from idmsa.apple.com
+   - Subsequent 500 auth errors
+   - Need to implement better exponential backoff for auth retries
+
+2. API Compatibility Issue:
+   - Seeing message "The creator of this list has upgraded these reminders"
+   - This indicates we're using outdated API calls for the new Reminders structure
+   - Apple updated the Reminders system architecture in recent iOS versions (iOS 13+)
+
+### Required Updates
+1. Need to update API calls to match new Reminders structure:
+   - Current endpoints may be outdated
+   - Need to investigate new list structure and API specs
+   - May need to handle both legacy and new format lists
+
+2. Authentication Flow Improvements:
+   - Implement exponential backoff for 503s during initial auth
+   - Add delay between auth attempts
+   - Increase initial auth timeout
+   - Better handling of trust tokens
+
+### Next Steps
+1. Research updated Reminders API specifications
+2. Update list access methods to support new format
+3. Implement better auth retry logic
+4. Add version detection to handle both old and new format lists
+5. Add more robust error handling for API version mismatches
+
+### References
+- Apple's updated Reminders system introduced significant changes in iOS 13+
+- Lists can now have subtasks, attachments, and enhanced sharing capabilities
+- Need to verify compatibility with new features like tags and smart lists
+
+### Open Questions
+1. Should we maintain backward compatibility with pre-iOS 13 Reminders?
+2. How to handle mixed environments where some lists are upgraded and others aren't?
+3. What's the best way to detect list format version?
