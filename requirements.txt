@@ -9,4 +9,5 @@ pytz
 python-dotenv
 pyobjc-framework-EventKit>=9.2
 pyobjc-framework-libdispatch>=9.2
+pyobjc-framework-Foundation>=9.2
 

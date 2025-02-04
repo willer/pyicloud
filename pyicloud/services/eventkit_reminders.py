@@ -1,5 +1,5 @@
 """EventKit-based Reminders service."""
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import uuid
 from typing import List, Dict, Optional, Union, Any, Tuple
@@ -13,12 +13,16 @@ from Foundation import (
     NSCalendarUnitHour,
     NSCalendarUnitMinute,
     NSCalendarUnitSecond,
-    NSError
+    NSError,
+    NSDateComponents,
+    NSTimeZone
 )
 from EventKit import (
     EKEventStore,
     EKEntityTypeReminder,
-    EKReminder
+    EKReminder,
+    EKCalendar,
+    EKSpan
 )
 
 logger = logging.getLogger(__name__)
@@ -32,225 +36,213 @@ class Priority:
     URGENT = 4
 
 class EventKitRemindersService:
-    """EventKit-based Reminders service."""
-
+    """Native macOS Reminders implementation using EventKit"""
+    
     def __init__(self):
-        """Initialize the EventKit reminders service."""
         self.store = EKEventStore.alloc().init()
-        self._authorize()
-        self._lists = {}  # Cache for reminder lists
-        self._reminders_by_guid = {}  # Cache for reminders
+        self._verify_authorization()
+        self._calendars = None
         self.refresh()
+        
+    def _verify_authorization(self):
+        """Verify we have permission to access Reminders."""
+        auth_status = EKEventStore.authorizationStatusForEntityType_(EKEntityTypeReminder)
+        if auth_status == 0:  # Not determined
+            def completion_handler(granted: bool, error: Optional[NSError]) -> None:
+                pass  # We don't need to do anything in the callback
+            
+            block = objc.Block(completion_handler, None, [objc.c_bool, NSError])
+            success = self.store.requestAccessToEntityType_completion_(
+                EKEntityTypeReminder,
+                block
+            )
+            if not success:
+                raise PyiCloudException("Failed to request Reminders access")
+        elif auth_status != 3:  # 3 = Authorized
+            raise PyiCloudException(
+                "Reminder access not authorized. Please enable in System Preferences."
+            )
 
-    def _authorize(self):
-        """Request authorization to access reminders."""
-        authorized = [False]
+    def _calendar_for_name(self, name):
+        """Get calendar by name."""
+        calendars = self.store.calendarsForEntityType_(EKEntityTypeReminder)
+        for calendar in calendars:
+            if calendar.title() == name:
+                return calendar
+        return None
 
-        def completion_handler(granted: bool, error: Optional[NSError]) -> None:
-            if error:
-                logger.error("EventKit authorization error: %s", error.localizedDescription())
-            authorized[0] = bool(granted)
+    def refresh(self, force=False):
+        """Refresh calendars from EventKit."""
+        self._calendars = self.store.calendarsForEntityType_(EKEntityTypeReminder)
+        return True
 
-        block = objc.block(completion_handler, None, [objc.c_bool, NSError])
+    @property
+    def lists(self):
+        """Get all reminder lists with their reminders."""
+        if not self._calendars:
+            self.refresh()
+        
+        result = {}
+        for calendar in self._calendars:
+            # Get reminders for this calendar
+            predicate = self.store.predicateForRemindersInCalendars_([calendar])
+            reminders = []
+            result_array = [None]
+            
+            def completion_handler(fetched_reminders):
+                result_array[0] = fetched_reminders
+            
+            self.store.fetchRemindersMatchingPredicate_completion_(
+                predicate,
+                completion_handler
+            )
+            
+            # Wait for results
+            while result_array[0] is None:
+                pass
+                
+            if result_array[0]:
+                for reminder in result_array[0]:
+                    reminders.append(self._convert_reminder_to_dict(reminder))
+            
+            result[calendar.title()] = reminders
+            
+        return result
 
-        self.store.requestAccessToEntityType_completion_(
-            EKEntityTypeReminder,
-            block
-        )
+    def get_reminder(self, guid: str) -> Optional[Dict]:
+        """Get a reminder by its GUID."""
+        reminder = self.store.calendarItemWithIdentifier_(guid)
+        if reminder:
+            return self._convert_reminder_to_dict(reminder)
+        return None
 
-        # Wait for authorization
-        while not authorized[0]:
-            pass
-
-        if not authorized[0]:
-            logger.error("EventKit authorization denied")
-            raise Exception("EventKit authorization denied")
-
-    def refresh(self) -> List[Dict]:
-        """Refresh and return all reminders."""
-        reminders = []
-        result = [None]
-
-        @objc.callbackFor(EKEventStore.fetchRemindersMatchingPredicate_completion_)
-        def completion_handler(self, reminders_list: List[EKReminder], error: Optional[NSError]) -> None:
-            if error:
-                logger.error("Error fetching reminders: %s", error.localizedDescription())
-            result[0] = reminders_list
-
-        predicate = self.store.predicateForRemindersInCalendars_(None)
-        self.store.fetchRemindersMatchingPredicate_completion_(
-            predicate,
-            completion_handler
-        )
-
-        # Wait for results
-        while result[0] is None:
-            pass
-
-        if result[0]:
-            for reminder in result[0]:
-                reminders.append(self._parse_reminder(reminder))
-
-        return reminders
-
-    def _parse_reminder(self, reminder: EKReminder) -> Dict:
-        """Parse an EKReminder into a dictionary."""
-        calendar = NSCalendar.currentCalendar()
-
-        reminder_dict = {
-            'title': reminder.title(),
-            'completed': reminder.completed(),
-            'priority': reminder.priority(),
-            'notes': reminder.notes(),
-            'identifier': str(uuid.uuid4()),  # Generate a unique identifier
+    def _convert_reminder_to_dict(self, reminder: EKReminder) -> Dict:
+        """Convert an EKReminder object to our standard dictionary format."""
+        result = {
+            'guid': str(reminder.calendarItemIdentifier()),
+            'title': str(reminder.title()),
+            'desc': str(reminder.notes()) if reminder.notes() else '',
+            'completed': bool(reminder.completed()),
+            'collection': str(reminder.calendar().title()),
+            'priority': int(reminder.priority()) if reminder.priority() else 0,
+            'p_guid': str(reminder.calendar().calendarIdentifier())
         }
 
         if reminder.dueDateComponents():
             components = reminder.dueDateComponents()
-            date = calendar.dateFromComponents_(components)
+            date = NSCalendar.currentCalendar().dateFromComponents_(components)
             if date:
-                reminder_dict['due_date'] = datetime.fromtimestamp(date.timeIntervalSince1970())
+                result['due'] = datetime.fromtimestamp(date.timeIntervalSince1970(), tz=datetime.timezone.utc)
 
-        return reminder_dict
-
-    def _convert_reminder_to_dict(self, reminder) -> Dict:
-        """Convert an EKReminder object to our standard dictionary format."""
-        return {
-            'guid': str(reminder.calendarItemIdentifier()),
-            'title': str(reminder.title()),
-            'desc': str(reminder.notes()) if reminder.notes() else '',
-            'due': reminder.dueDateComponents().date() if reminder.dueDateComponents() else None,
-            'completed': bool(reminder.completed()),
-            'collection': str(reminder.calendar().title()),
-            'priority': int(reminder.priority()) if reminder.priority() else Priority.NONE,
-            'p_guid': str(reminder.calendar().calendarIdentifier())
-        }
-
-    def _create_reminder(self, title: str, calendar) -> EKReminder:
-        """Create a new EKReminder object."""
-        reminder = EKReminder.reminderWithEventStore_(self.store)
-        reminder.setTitle_(title)
-        reminder.setCalendar_(calendar)
-        return reminder
+        return result
 
     def post(self, title: str, description: str = "", collection: Optional[str] = None,
-             priority: int = Priority.NONE, tags: List[str] = None,
-             due_date: Optional[datetime] = None, **kwargs) -> Optional[str]:
+             priority: int = 0, tags: List[str] = None,
+             due_date: Optional[datetime] = None) -> Optional[str]:
         """Create a new reminder."""
         try:
-            # Get the target calendar
-            if collection and collection in self._lists:
-                calendar = self._lists[collection]['calendar']
-            else:
-                # Use the first available calendar
-                calendar = next(iter(self._lists.values()))['calendar']
+            reminder = EKReminder.reminderWithEventStore_(self.store)
+            reminder.setTitle_(title)
+            reminder.setNotes_(description or "")
+            reminder.setPriority_(priority)
 
-            # Create the reminder
-            reminder = self._create_reminder(title, calendar)
-            
-            # Set properties
-            if description:
-                reminder.setNotes_(description)
-            if priority is not None:
-                reminder.setPriority_(priority)
+            if collection:
+                calendar = None
+                for cal in self._calendars:
+                    if cal.title() == collection:
+                        calendar = cal
+                        break
+                if calendar:
+                    reminder.setCalendar_(calendar)
+                else:
+                    # Use first available calendar if specified one not found
+                    reminder.setCalendar_(self._calendars[0])
+            else:
+                # Use first available calendar
+                reminder.setCalendar_(self._calendars[0])
+
             if due_date:
-                calendar = NSCalendar.currentCalendar()
-                components = calendar.components_fromDate_(
-                    NSCalendarUnitYear | 
-                    NSCalendarUnitMonth | 
-                    NSCalendarUnitDay |
-                    NSCalendarUnitHour |
-                    NSCalendarUnitMinute |
-                    NSCalendarUnitSecond,
-                    NSDate.dateWithTimeIntervalSince1970_(due_date.timestamp())
-                )
+                # Convert to UTC for storage
+                if due_date.tzinfo is not None:
+                    due_date = due_date.astimezone(datetime.timezone.utc)
+                
+                components = NSDateComponents.alloc().init()
+                components.setYear_(due_date.year)
+                components.setMonth_(due_date.month)
+                components.setDay_(due_date.day)
+                components.setHour_(due_date.hour)
+                components.setMinute_(due_date.minute)
+                components.setSecond_(due_date.second)
+                components.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
                 reminder.setDueDateComponents_(components)
 
-            # Save the reminder
             success, error = self.store.saveReminder_commit_error_(reminder, True, None)
             if success:
-                # Update our cache
-                reminder_data = self._convert_reminder_to_dict(reminder)
-                self._reminders_by_guid[reminder_data['guid']] = reminder_data
-                return reminder_data['guid']
+                return str(reminder.calendarItemIdentifier())
             else:
                 logger.error(f"Failed to save reminder: {error}")
-                
+
         except Exception as e:
             logger.error(f"Failed to create reminder: {str(e)}")
-            
-        return None
 
-    def get_reminder(self, guid: str) -> Optional[Dict]:
-        """Get a reminder by its GUID."""
-        return self._reminders_by_guid.get(guid)
+        return None
 
     def update(self, guid: str, title: Optional[str] = None,
                description: Optional[str] = None, due_date: Optional[datetime] = None,
-               collection: Optional[str] = None, priority: Optional[int] = None,
-               tags: Optional[List[str]] = None) -> bool:
+               collection: Optional[str] = None, priority: Optional[int] = None) -> bool:
         """Update a reminder."""
-        try:
-            reminder = self.store.calendarItemWithIdentifier_(guid)
-            if not reminder:
-                return False
+        reminder = self.store.calendarItemWithIdentifier_(guid)
+        if not reminder:
+            return False
 
+        try:
             if title is not None:
                 reminder.setTitle_(title)
             if description is not None:
                 reminder.setNotes_(description)
             if priority is not None:
                 reminder.setPriority_(priority)
-            if due_date is not None:
-                calendar = NSCalendar.currentCalendar()
-                components = calendar.components_fromDate_(
-                    NSCalendarUnitYear | 
-                    NSCalendarUnitMonth | 
-                    NSCalendarUnitDay |
-                    NSCalendarUnitHour |
-                    NSCalendarUnitMinute |
-                    NSCalendarUnitSecond,
-                    NSDate.dateWithTimeIntervalSince1970_(due_date.timestamp())
-                )
+
+            if collection:
+                calendar = self._calendar_for_name(collection)
+                if calendar:
+                    reminder.setCalendar_(calendar)
+
+            if due_date:
+                components = NSDateComponents.alloc().init()
+                components.setYear_(due_date.year)
+                components.setMonth_(due_date.month)
+                components.setDay_(due_date.day)
+                components.setHour_(due_date.hour)
+                components.setMinute_(due_date.minute)
+                components.setSecond_(due_date.second)
                 reminder.setDueDateComponents_(components)
-            if collection is not None and collection in self._lists:
-                reminder.setCalendar_(self._lists[collection]['calendar'])
 
             success, error = self.store.saveReminder_commit_error_(reminder, True, None)
-            if success:
-                # Update our cache
-                reminder_data = self._convert_reminder_to_dict(reminder)
-                self._reminders_by_guid[guid] = reminder_data
-                return True
-            else:
+            if not success:
                 logger.error(f"Failed to update reminder: {error}")
+            return success
 
         except Exception as e:
             logger.error(f"Failed to update reminder: {str(e)}")
-
-        return False
+            return False
 
     def complete(self, guid: str) -> bool:
         """Mark a reminder as completed."""
-        try:
-            reminder = self.store.calendarItemWithIdentifier_(guid)
-            if not reminder:
-                return False
+        reminder = self.store.calendarItemWithIdentifier_(guid)
+        if not reminder:
+            return False
 
+        try:
             reminder.setCompleted_(True)
             success, error = self.store.saveReminder_commit_error_(reminder, True, None)
-            if success:
-                # Update our cache
-                reminder_data = self._convert_reminder_to_dict(reminder)
-                self._reminders_by_guid[guid] = reminder_data
-                return True
-            else:
+            if not success:
                 logger.error(f"Failed to complete reminder: {error}")
+            return success
 
         except Exception as e:
             logger.error(f"Failed to complete reminder: {str(e)}")
-
-        return False
+            return False
 
     def get_reminders_by_collection(self, collection_name: str,
                                   include_completed: bool = False) -> List[Dict]:
@@ -280,28 +272,55 @@ class EventKitRemindersService:
 
         return []  # Return empty list since we can't get results synchronously
 
-    def get_reminders_by_due_date(self, start_date: datetime, end_date: datetime) -> List[Dict]:
+    def get_reminders_by_due_date(self, start_date: datetime, end_date: datetime, include_completed: bool = False) -> List[Dict]:
         """Get reminders due between start_date and end_date."""
-        calendar = NSCalendar.currentCalendar()
+        logger.debug("Original start_date: %s (%s), end_date: %s (%s)", 
+                    start_date, start_date.tzinfo, end_date, end_date.tzinfo)
+        
+        # Convert to UTC for comparison
+        if start_date.tzinfo is not None:
+            start_date = start_date.astimezone(datetime.timezone.utc)
+        if end_date.tzinfo is not None:
+            end_date = end_date.astimezone(datetime.timezone.utc)
+            
+        logger.debug("Converted start_date: %s (%s), end_date: %s (%s)", 
+                    start_date, start_date.tzinfo, end_date, end_date.tzinfo)
+
         start = NSDate.dateWithTimeIntervalSince1970_(start_date.timestamp())
         end = NSDate.dateWithTimeIntervalSince1970_(end_date.timestamp())
+        
+        logger.debug("NSDate start: %s, end: %s", start, end)
 
         result = [None]
 
-        @objc.callbackFor(EKEventStore.fetchRemindersMatchingPredicate_completion_)
-        def completion_handler(self, reminders_list: List[EKReminder], error: Optional[NSError]) -> None:
+        def completion_handler(reminders_list: List[EKReminder], error: Optional[NSError]) -> None:
             if error:
                 logger.error("Error fetching reminders: %s", error.localizedDescription())
             result[0] = reminders_list
+            if reminders_list:
+                logger.debug("Found %d reminders", len(reminders_list))
+                for reminder in reminders_list:
+                    components = reminder.dueDateComponents()
+                    date = NSCalendar.currentCalendar().dateFromComponents_(components) if components else None
+                    logger.debug("Reminder: title=%s, due_components=%s, due_date=%s", 
+                               reminder.title(),
+                               components,
+                               date)
 
-        predicate = self.store.predicateForIncompleteRemindersWithDueDateStarting_ending_calendars_(
-            start,
-            end,
-            None
-        )
+        block = objc.Block(completion_handler, None, [objc.c_array(EKReminder), NSError])
+
+        if include_completed:
+            predicate = self.store.predicateForRemindersInCalendars_(None)
+        else:
+            predicate = self.store.predicateForIncompleteRemindersWithDueDateStarting_ending_calendars_(
+                start,
+                end,
+                None
+            )
+
         self.store.fetchRemindersMatchingPredicate_completion_(
             predicate,
-            completion_handler
+            block
         )
 
         # Wait for results
@@ -311,7 +330,23 @@ class EventKitRemindersService:
         reminders = []
         if result[0]:
             for reminder in result[0]:
-                reminders.append(self._parse_reminder(reminder))
+                # For completed reminders, we need to filter by date manually
+                if include_completed:
+                    due_date = reminder.dueDateComponents()
+                    if due_date:
+                        date = NSCalendar.currentCalendar().dateFromComponents_(due_date)
+                        if date:
+                            reminder_date = datetime.fromtimestamp(date.timeIntervalSince1970(), tz=datetime.timezone.utc)
+                            logger.debug("Checking reminder %s: due=%s, start=%s, end=%s", 
+                                       reminder.title(), reminder_date, start_date, end_date)
+                            if start_date <= reminder_date <= end_date:
+                                reminders.append(self._convert_reminder_to_dict(reminder))
+                else:
+                    reminders.append(self._convert_reminder_to_dict(reminder))
+
+        logger.debug("Returning %d reminders", len(reminders))
+        for reminder in reminders:
+            logger.debug("Returned reminder: %s", reminder)
 
         return reminders
 
@@ -340,9 +375,4 @@ class EventKitRemindersService:
         results = {}
         for guid in guids:
             results[guid] = self.move_reminder(guid, target_collection)
-        return results
-
-    @property
-    def lists(self):
-        """Get all reminder lists."""
-        return {name: {'guid': info['guid']} for name, info in self._lists.items()} 
+        return results 
