@@ -130,9 +130,15 @@ class EventKitRemindersService:
 
         if reminder.dueDateComponents():
             components = reminder.dueDateComponents()
-            date = NSCalendar.currentCalendar().dateFromComponents_(components)
+            calendar = NSCalendar.currentCalendar()
+            # Set the calendar's timezone to UTC for consistent handling
+            calendar.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
+            date = calendar.dateFromComponents_(components)
             if date:
-                result['due'] = datetime.fromtimestamp(date.timeIntervalSince1970(), tz=datetime.timezone.utc)
+                # Convert to UTC timestamp and create UTC datetime
+                timestamp = date.timeIntervalSince1970()
+                result['due'] = datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
+                logger.debug("Converted reminder due date to UTC: %s (from timestamp: %s)", result['due'], timestamp)
 
         return result
 
@@ -165,6 +171,15 @@ class EventKitRemindersService:
                 # Convert to UTC for storage
                 if due_date.tzinfo is not None:
                     due_date = due_date.astimezone(datetime.timezone.utc)
+                    logger.debug("Converted due_date to UTC: %s", due_date)
+                else:
+                    # If naive datetime, assume UTC
+                    due_date = due_date.replace(tzinfo=datetime.timezone.utc)
+                    logger.debug("Added UTC timezone to naive due_date: %s", due_date)
+                
+                # Create calendar with UTC timezone
+                calendar = NSCalendar.currentCalendar()
+                calendar.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
                 
                 components = NSDateComponents.alloc().init()
                 components.setYear_(due_date.year)
@@ -174,6 +189,12 @@ class EventKitRemindersService:
                 components.setMinute_(due_date.minute)
                 components.setSecond_(due_date.second)
                 components.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
+                
+                # Convert components to NSDate to verify the conversion
+                date = calendar.dateFromComponents_(components)
+                if date:
+                    logger.debug("Verified NSDate from components: %s", datetime.fromtimestamp(date.timeIntervalSince1970(), tz=datetime.timezone.utc))
+                
                 reminder.setDueDateComponents_(components)
 
             success, error = self.store.saveReminder_commit_error_(reminder, True, None)
@@ -273,19 +294,29 @@ class EventKitRemindersService:
         return []  # Return empty list since we can't get results synchronously
 
     def get_reminders_by_due_date(self, start_date: datetime, end_date: datetime, include_completed: bool = False) -> List[Dict]:
-        """Get reminders due between start_date and end_date."""
+        """Get reminders due between start_date and end_date (inclusive)."""
         logger.debug("Original start_date: %s (%s), end_date: %s (%s)", 
                     start_date, start_date.tzinfo, end_date, end_date.tzinfo)
         
         # Convert to UTC for comparison
         if start_date.tzinfo is not None:
             start_date = start_date.astimezone(datetime.timezone.utc)
+        else:
+            start_date = start_date.replace(tzinfo=datetime.timezone.utc)
+            
         if end_date.tzinfo is not None:
             end_date = end_date.astimezone(datetime.timezone.utc)
+        else:
+            end_date = end_date.replace(tzinfo=datetime.timezone.utc)
             
-        logger.debug("Converted start_date: %s (%s), end_date: %s (%s)", 
+        # Set start_date to beginning of day and end_date to end of day
+        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+        logger.debug("Adjusted start_date: %s (%s), end_date: %s (%s)", 
                     start_date, start_date.tzinfo, end_date, end_date.tzinfo)
 
+        # Create NSDate objects from UTC timestamps
         start = NSDate.dateWithTimeIntervalSince1970_(start_date.timestamp())
         end = NSDate.dateWithTimeIntervalSince1970_(end_date.timestamp())
         
@@ -301,14 +332,15 @@ class EventKitRemindersService:
                 logger.debug("Found %d reminders", len(reminders_list))
                 for reminder in reminders_list:
                     components = reminder.dueDateComponents()
-                    date = NSCalendar.currentCalendar().dateFromComponents_(components) if components else None
+                    calendar = NSCalendar.currentCalendar()
+                    calendar.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
+                    date = calendar.dateFromComponents_(components) if components else None
                     logger.debug("Reminder: title=%s, due_components=%s, due_date=%s", 
-                               reminder.title(),
-                               components,
-                               date)
+                               reminder.title(), components, date)
 
         block = objc.Block(completion_handler, None, [objc.c_array(EKReminder), NSError])
 
+        # Use the current calendar to create the predicate
         if include_completed:
             predicate = self.store.predicateForRemindersInCalendars_(None)
         else:
@@ -334,15 +366,21 @@ class EventKitRemindersService:
                 if include_completed:
                     due_date = reminder.dueDateComponents()
                     if due_date:
-                        date = NSCalendar.currentCalendar().dateFromComponents_(due_date)
+                        calendar = NSCalendar.currentCalendar()
+                        calendar.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
+                        date = calendar.dateFromComponents_(due_date)
                         if date:
+                            # Convert to UTC datetime for comparison
                             reminder_date = datetime.fromtimestamp(date.timeIntervalSince1970(), tz=datetime.timezone.utc)
                             logger.debug("Checking reminder %s: due=%s, start=%s, end=%s", 
                                        reminder.title(), reminder_date, start_date, end_date)
                             if start_date <= reminder_date <= end_date:
                                 reminders.append(self._convert_reminder_to_dict(reminder))
                 else:
-                    reminders.append(self._convert_reminder_to_dict(reminder))
+                    # For incomplete reminders, the predicate has already filtered by date
+                    reminder_dict = self._convert_reminder_to_dict(reminder)
+                    logger.debug("Adding incomplete reminder: %s, due=%s", reminder_dict["title"], reminder_dict.get("due"))
+                    reminders.append(reminder_dict)
 
         logger.debug("Returning %d reminders", len(reminders))
         for reminder in reminders:
@@ -350,18 +388,74 @@ class EventKitRemindersService:
 
         return reminders
 
-    def get_upcoming_reminders(self) -> List[Dict]:
-        """Get upcoming reminders."""
-        now = datetime.now()
-        future = now.replace(year=now.year + 1)  # Get reminders for the next year
-        return self.get_reminders_by_due_date(now, future)
+    def get_upcoming_reminders(self, days: int = 7, include_completed: bool = False) -> Dict[str, List[Dict]]:
+        """Get upcoming reminders grouped by collection."""
+        now = datetime.now(datetime.timezone.utc)
+        end_date = now + timedelta(days=days)
+        
+        # Get all reminders due in the next N days
+        reminders = self.get_reminders_by_due_date(
+            start_date=now,
+            end_date=end_date,
+            include_completed=include_completed
+        )
+        
+        # Group by collection
+        result = {}
+        for reminder in reminders:
+            collection = reminder["collection"]
+            if collection not in result:
+                result[collection] = []
+            result[collection].append(reminder)
+            
+        return result
 
     def move_reminder(self, guid: str, target_collection: str) -> bool:
-        """Move a reminder to a different collection."""
-        if target_collection not in self._lists:
-            return False
+        """Move a reminder to a different collection.
 
-        return self.update(guid, collection=target_collection)
+        Args:
+            guid: The GUID of the reminder to move.
+            target_collection: The collection to move the reminder to.
+
+        Returns:
+            bool: True if the move was successful, False otherwise.
+        """
+        try:
+            reminder = self.get_reminder(guid)
+            if not reminder:
+                logger.error("Reminder %s not found", guid)
+                return False
+
+            if reminder["collection"] == target_collection:
+                # Already in the target collection
+                return True
+
+            # Attempt to move the reminder
+            try:
+                response = self._service.post(
+                    f"/rd/reminders/{guid}/move",
+                    {
+                        "collection": target_collection,
+                        "clientData": {"timezone": self._get_timezone()}
+                    }
+                )
+            except Exception as e:
+                if "Moving between lists is unsupported in this account" in str(e):
+                    logger.warning("Moving reminders between lists is not supported by this account")
+                    return False
+                raise
+
+            if not response.ok:
+                if "Moving between lists is unsupported in this account" in response.text:
+                    logger.warning("Moving reminders between lists is not supported by this account")
+                    return False
+                logger.error("Failed to move reminder: %s", response.text)
+                return False
+
+            return True
+        except Exception as e:
+            logger.error("Failed to move reminder: %s", str(e))
+            return False
 
     def batch_complete(self, guids: List[str]) -> Dict[str, bool]:
         """Complete multiple reminders in batch."""
@@ -371,8 +465,20 @@ class EventKitRemindersService:
         return results
 
     def batch_move(self, guids: List[str], target_collection: str) -> Dict[str, bool]:
-        """Move multiple reminders to a different collection in batch."""
+        """Move multiple reminders to a different collection in batch.
+
+        Args:
+            guids: List of GUIDs of reminders to move.
+            target_collection: The collection to move the reminders to.
+
+        Returns:
+            Dict[str, bool]: A dictionary mapping GUIDs to success status.
+        """
         results = {}
         for guid in guids:
-            results[guid] = self.move_reminder(guid, target_collection)
+            try:
+                results[guid] = self.move_reminder(guid, target_collection)
+            except Exception as e:
+                logger.error("Failed to move reminder %s: %s", guid, str(e))
+                results[guid] = False
         return results 

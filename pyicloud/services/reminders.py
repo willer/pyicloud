@@ -399,7 +399,8 @@ class EventKitRemindersService:
             results[guid] = self.move_reminder(guid, target_collection)
         return results
 
-    def get_upcoming_reminders(self, days: int = 7) -> Dict[str, List[Dict]]:
+    def get_upcoming_reminders(self, days: int = 7,
+                             include_completed: bool = False) -> Dict[str, List[Dict]]:
         """Get upcoming reminders grouped by collection."""
         start_date = datetime.now()
         end_date = start_date + timedelta(days=days)
@@ -468,7 +469,7 @@ class RemindersService:
     def get_upcoming_reminders(self, days: int = 7,
                              include_completed: bool = False) -> Dict[str, List[Dict]]:
         """Get reminders due in the next N days, grouped by collection."""
-        return self._impl.get_upcoming_reminders(days, include_completed)
+        return self._impl.get_upcoming_reminders(days=days, include_completed=include_completed)
 
     def move_reminder(self, guid: str, target_collection: str) -> bool:
         """Move a reminder to a different collection."""
