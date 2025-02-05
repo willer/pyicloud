@@ -30,6 +30,7 @@ from pyicloud.services import (
     PhotosService,
     AccountService,
     DriveService,
+    NotesService,
 )
 from pyicloud.utils import get_password_from_keyring
 
@@ -758,6 +759,16 @@ class PyiCloudService:
                 params=self.params,
             )
         return self._drive
+
+    @property
+    def notes(self):
+        """Gets the 'Notes' service."""
+        service_root = self._get_webservice_url("notes")
+        return NotesService(
+            session=self.session,
+            service_root=service_root,
+            max_retries=3
+        )
 
     def __str__(self):
         return f"iCloud API: {self.user.get('apple_id')}"

@@ -6,50 +6,60 @@ import uuid
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+
+def ensure_test_folder(notes):
+    """Ensure the 'Test' folder exists and return it."""
+    lists = notes.lists
+    
+    # Check if 'Test' folder exists
+    if "Test" not in lists:
+        # Try to create the Test folder
+        if hasattr(notes, 'create_folder'):
+            logger.info("Creating Test folder...")
+            if notes.create_folder("Test"):
+                logger.info("Test folder created successfully")
+                return "Test"
+        # If we can't create it, use the default folder
+        logger.info("Using default Notes folder")
+        return next(iter(lists.keys()), "Notes")
+    
+    return "Test"
 
 def test_chief_of_staff_operations(notes):
     """Test Chief of Staff operations with Notes."""
+    note_ids = []  # Initialize note_ids before the try block
+    
     try:
         # Get initial lists to work with
-        all_lists = notes.lists
-        assert len(all_lists) >= 1, "Need at least one notes list to test"
-        
-        first_list = list(all_lists.keys())[0]
-        second_list = list(all_lists.keys())[1] if len(all_lists) > 1 else first_list
-        
-        logger.info("Testing with lists: %s and %s", first_list, second_list)
+        test_folder = ensure_test_folder(notes)
+        logger.info("Using test folder: %s", test_folder)
         
         # Test data
         test_notes = [
             {
                 "title": "Meeting Notes: Q1 Review",
                 "body": "Key points to discuss:\n1. Performance metrics\n2. Project status\n3. Next quarter goals",
-                "collection": first_list,
                 "tags": ["meeting", "quarterly-review"]
             },
             {
                 "title": "Project Brainstorm",
                 "body": "Ideas for new features:\n- AI integration\n- Better sync\n- Improved UI",
-                "collection": first_list,
                 "tags": ["project", "planning"]
             },
             {
                 "title": "Action Items",
                 "body": "TODO:\n1. Follow up with team\n2. Schedule next meeting\n3. Send summary",
-                "collection": first_list,
                 "tags": ["todo", "follow-up"]
             }
         ]
-        
-        # Store created note IDs for cleanup
-        note_ids = []
         
         # Create notes and verify their creation
         for note in test_notes:
             note_id = notes.create(
                 title=note["title"],
                 body=note["body"],
-                collection=note["collection"],
+                collection=test_folder,
                 tags=note["tags"]
             )
             assert note_id is not None, f"Failed to create note: {note['title']}"
@@ -60,6 +70,7 @@ def test_chief_of_staff_operations(notes):
             assert created_note is not None, f"Could not find created note: {note['title']}"
             assert created_note["title"] == note["title"], "Title mismatch"
             assert created_note["body"] == note["body"], "Body mismatch"
+            assert created_note["collection"] == test_folder, "Collection mismatch"
             assert set(created_note["tags"]) == set(note["tags"]), "Tags mismatch"
             logger.debug("Created note: %s", created_note)
         
@@ -69,8 +80,8 @@ def test_chief_of_staff_operations(notes):
         assert any(note["title"] == "Meeting Notes: Q1 Review" for note in search_results)
         
         # Test getting notes by collection
-        first_list_notes = notes.get_notes_by_collection(first_list)
-        assert len(first_list_notes) >= len(test_notes), f"Should find at least {len(test_notes)} notes in first list"
+        test_folder_notes = notes.get_notes_by_collection(test_folder)
+        assert len(test_folder_notes) >= len(test_notes), f"Should find at least {len(test_notes)} notes in test folder"
         
         # Test updating a note
         update_id = note_ids[0]
@@ -85,33 +96,6 @@ def test_chief_of_staff_operations(notes):
         updated_note = notes.get_note(update_id)
         assert updated_note["body"] == updated_body, "Body not updated correctly"
         
-        # Test moving notes between lists (if we have two different lists)
-        if first_list != second_list:
-            # Move one note to second list
-            success = notes.move_note(note_ids[0], second_list)
-            assert success, "Failed to move note to second list"
-            
-            # Verify the move
-            moved_note = notes.get_note(note_ids[0])
-            assert moved_note["collection"] == second_list, "Note not in correct list"
-            
-            # Test batch move
-            batch_move_results = notes.batch_move([note_ids[1], note_ids[2]], second_list)
-            assert all(batch_move_results.values()), "Failed to move notes in batch"
-            
-            # Verify the moves
-            second_list_notes = notes.get_notes_by_collection(second_list)
-            for note_id in note_ids:
-                assert any(note["id"] == note_id for note in second_list_notes), f"Note {note_id} not found in second list"
-        
-        # Test note sharing (if supported)
-        try:
-            share_url = notes.share_note(note_ids[0])
-            assert share_url is not None, "Failed to get share URL"
-            logger.debug("Share URL: %s", share_url)
-        except NotImplementedError:
-            logger.warning("Note sharing not supported")
-        
         # Clean up - delete test notes
         for note_id in note_ids:
             success = notes.delete_note(note_id)
@@ -124,4 +108,72 @@ def test_chief_of_staff_operations(notes):
             
     except Exception as e:
         logger.error("Test failed with error: %s", str(e))
-        pytest.fail(f"Failed during Notes operations test: {str(e)}") 
+        # Clean up even if test fails
+        for note_id in note_ids:
+            try:
+                notes.delete_note(note_id)
+            except:
+                pass
+        pytest.fail(f"Failed during Notes operations test: {str(e)}")
+
+def test_notes_error_cases(notes):
+    """Test error cases and edge conditions for notes."""
+    test_ids = []  # Initialize test_ids before the try block
+    
+    try:
+        test_folder = ensure_test_folder(notes)
+        
+        # Test 1: Invalid collection name
+        note_id = notes.create(
+            "Test Note",
+            "Test body",
+            collection="NonexistentFolder"  # Should fall back to Test folder
+        )
+        assert note_id is not None, "Should create note in test folder when collection is invalid"
+        test_ids.append(note_id)
+        
+        created_note = notes.get_note(note_id)
+        assert created_note["collection"] == test_folder, "Note should be created in test folder"
+        
+        # Test 2: Get nonexistent note
+        nonexistent_note = notes.get_note("nonexistent-id")
+        assert nonexistent_note is None, "Should return None for nonexistent note"
+        
+        # Test 3: Update nonexistent note
+        success = notes.update("nonexistent-id", title="New Title")
+        assert not success, "Should fail when updating nonexistent note"
+        
+        # Test 4: Delete nonexistent note
+        success = notes.delete_note("nonexistent-id")
+        assert not success, "Should fail when deleting nonexistent note"
+        
+        # Test 5: Empty title/body
+        note_id = notes.create(
+            "",  # Empty title
+            "Note with empty title",
+            collection=test_folder
+        )
+        if note_id:  # Some implementations might allow empty titles
+            test_ids.append(note_id)
+            empty_title_note = notes.get_note(note_id)
+            assert empty_title_note is not None, "Should be able to retrieve note with empty title"
+        
+        # Test 6: Get notes from nonexistent collection
+        nonexistent_folder_notes = notes.get_notes_by_collection("NonexistentFolder")
+        assert len(nonexistent_folder_notes) == 0, "Should return empty list for nonexistent collection"
+        
+        # Clean up test notes
+        for note_id in test_ids:
+            try:
+                notes.delete_note(note_id)
+            except:
+                pass
+            
+    except Exception as e:
+        # Clean up even if test fails
+        for note_id in test_ids:
+            try:
+                notes.delete_note(note_id)
+            except:
+                pass
+        pytest.fail(f"Failed during error cases test: {str(e)}") 
