@@ -1,6 +1,4 @@
 #!/bin/bash
 
-aider --architect --model=openrouter/deepseek/deepseek-r1 --editor-model=sonnet --no-auto-commits --test-cmd=./run-tests.sh --auto-test
-#aider --architect --model r1 --editor-model sonnet --no-auto-commits --test-cmd ./run-tests.sh --auto-test
-#aider --architect --model sonnet --editor-model sonnet --no-auto-commits --test-cmd ./run-tests.sh --auto-test
+aider --architect --model=openrouter/deepseek/deepseek-r1 --editor-model=sonnet --no-auto-commits --yes-always --test-cmd=./run-tests.sh --auto-test
 

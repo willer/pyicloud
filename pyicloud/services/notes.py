@@ -42,13 +42,16 @@ class NotesService:
         if not web_token:
             raise NotesNotAvailable("Failed to get web token")
 
-        # Set up headers for iOS 13+ format
+        # Set up headers with working calendar service values
         self.session.headers.update({
-            "Origin": "https://www.icloud.com",
-            "Referer": "https://www.icloud.com/",
-            "X-Apple-I-Web-Token": web_token,
-            "Content-Type": "application/json",
-            "X-Apple-I-ClientTime": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'X-Apple-Auth-Token': session.service.session_data.get('session_token'),
+            'X-Apple-Time-Zone': get_localzone_name(),
+            'X-Apple-CloudKit-Request-ISO8601Timestamp': datetime.utcnow().isoformat(),
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Host': 'p85-notes.icloud.com',  # Required header for iOS 17
+            'Origin': 'https://www.icloud.com',
+            'Referer': 'https://www.icloud.com/'
         })
         
         # Add service-specific parameters for iOS 13+ format
@@ -68,6 +71,20 @@ class NotesService:
         except Exception as e:
             logger.warning(f"Failed to refresh notes authentication: {e}")
         
+        # Get web token from session
+        web_token = session.service.session_data.get("session_token")
+        if not web_token:
+            raise NotesNotAvailable("Failed to get session token")
+
+        # Update headers with correct iOS 13+ values
+        self.session.headers.update({
+            "X-Apple-I-Web-Token": web_token,
+            "X-Apple-Routing-Key": f"{self.params['dsid']}:0:notes",
+            "X-Apple-I-Protocol-Version": "1.0",
+            "X-Apple-I-TimeZone": get_localzone_name(),
+            "X-Apple-I-Client-Time": datetime.now().isoformat()
+        })
+
         # Initial refresh
         if not self.refresh():
             raise NotesNotAvailable("Failed to initialize notes service")
@@ -84,18 +101,30 @@ class NotesService:
                 logger.debug(f"Making {method} request to {endpoint}")
                 request_params = {**self.params, **(params or {})}
                 
+                # Add required headers
+                headers = {
+                    'X-Apple-Web-Token': self.session.service.session_data.get('session_token'),
+                    'X-Apple-Time-Zone': get_localzone_name(),
+                    'X-Apple-CloudKit-Request-ISO8601Timestamp': 
+                        datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'X-Apple-I-ClientTime': datetime.now().strftime('%Y-%m-%dT%H:%M:%S%z')
+                }
+                
+                url = endpoint if endpoint.startswith('http') else f"{self._service_root}{endpoint}"
                 if method.lower() == 'get':
                     response = self.session.get(
-                        endpoint if endpoint.startswith('http') else f"{self._service_root}{endpoint}",
+                        url,
                         params=request_params,
-                        timeout=timeout
+                        timeout=timeout,
+                        headers=headers
                     )
                 else:
                     response = self.session.post(
-                        endpoint if endpoint.startswith('http') else f"{self._service_root}{endpoint}",
-                        data=json.dumps(data) if data else None,
+                        url,
+                        json=data,  # Changed from data=json.dumps(data)
                         params=request_params,
-                        timeout=timeout
+                        timeout=timeout,
+                        headers=headers
                     )
                 
                 # Handle different error cases
@@ -116,6 +145,15 @@ class NotesService:
                     retry_after = min(int(response.headers.get('Retry-After', 2)), 5)  # Cap at 5 seconds
                     logger.warning("Got 503, waiting %d seconds before retry", retry_after)
                     time.sleep(retry_after)
+                    retry_count += 1
+                    continue
+                    
+                elif response.status_code == 450:  # Notes-specific auth failures
+                    logger.debug("Notes-specific auth failure, refreshing...")
+                    self.session.service.authenticate(
+                        force_refresh=True,
+                        service='notes'
+                    )
                     retry_count += 1
                     continue
                     
@@ -145,8 +183,18 @@ class NotesService:
     def refresh(self) -> bool:
         """Refresh the notes data."""
         try:
-            # Get initial startup data
-            startup = self._make_request("get", "/no/startup")
+            # Get initial startup data with proper parameters
+            startup = self._make_request(
+                "post",  # Changed from GET to POST
+                "/no/startup",
+                data={
+                    "clientVersion": "4039.6.6",
+                    "syncToken": "",
+                    "requestID": str(uuid.uuid4()).upper(),
+                    "schema": "chunked:2",  # New required field
+                    "timeout": 10000
+                }
+            )
             if not startup:
                 return False
             
@@ -158,41 +206,60 @@ class NotesService:
             self._notes_by_guid = {}
             self._tags = set()
 
-            # Process notes and folders from startup data
-            if startup and 'notes' in startup:
-                # Create default root folder if it doesn't exist
-                if '/' not in self.collections:
-                    self.collections['/'] = {
-                        "guid": "root",
+            # Process folders first
+            folders = startup.get('folders', [])
+            for folder in folders:
+                folder_guid = folder.get('identifier') or folder.get('folderId')
+                folder_name = folder.get('name') or folder.get('folderName', '/')
+                self.collections[folder_name] = {
+                    "guid": folder_guid or f"folder_{folder_name}",
+                    "ctag": folder.get('serverCtag') or folder.get('etag', ''),
+                    "type": "folder",
+                    "parentId": folder.get('parentIdentifier') or folder.get('parentId', 'root'),
+                    "order": folder.get('sortOrder') or folder.get('order', 0)
+                }
+
+            # Create default root folder if no folders exist
+            if not self.collections:
+                self.collections['/'] = {
+                    "guid": "root",
+                    "ctag": startup.get('syncToken', ''),
+                    "type": "folder",
+                    "parentId": "root",
+                    "order": 0
+                }
+
+            # Process notes
+            notes = startup.get('notes', [])
+            for note in notes:
+                folder_name = note.get('folderName', '/')
+                if folder_name not in self.collections:
+                    self.collections[folder_name] = {
+                        "guid": f"folder_{folder_name}",
                         "ctag": startup.get('syncToken', ''),
                         "type": "folder",
                         "parentId": "root",
-                        "order": 0
+                        "order": len(self.collections)
                     }
                 
-                # Process notes and their folders
-                for note in startup['notes']:
-                    folder_name = note.get('folderName', '/')
-                    if folder_name not in self.collections:
-                        self.collections[folder_name] = {
-                            "guid": f"folder_{folder_name}",  # Generate a folder GUID
-                            "ctag": startup.get('syncToken', ''),
-                            "type": "folder",
-                            "parentId": "root",
-                            "order": len(self.collections)
-                        }
-                    
-                    # Add note to its folder's list
-                    note_data = {
-                        "guid": note['noteId'],
-                        "title": note['subject'],
-                        "folder": folder_name,
-                        "size": note['size'],
-                        "modified": note['dateModified'],
-                        "content": note['detail']['content'] if 'detail' in note else None
-                    }
-                    self.lists[folder_name].append(note_data)
-                    self._notes_by_guid[note['noteId']] = note_data
+                # Extract note data with proper field mapping
+                note_guid = note.get('identifier') or note.get('noteGuid')
+                note_data = {
+                    "guid": note_guid,
+                    "title": note.get('title') or note.get('subject', ''),
+                    "folder": folder_name,
+                    "size": note.get('contentLength') or note.get('size', 0),
+                    "modified": note.get('modified') or note.get('lastModifiedDate'),
+                    "content": note.get('content') or note.get('detail', {}).get('content'),
+                    "tags": note.get('tags', []),
+                    "created": note.get('created') or note.get('createdDate'),
+                    "isShared": note.get('isShared', False),
+                    "hasAttachments": note.get('hasAttachments', False)
+                }
+                self.lists[folder_name].append(note_data)
+                self._notes_by_guid[note_data['guid']] = note_data
+                if note_data['tags']:
+                    self._tags.update(note_data['tags'])
 
             return True
 
@@ -218,23 +285,23 @@ class NotesService:
             # Format the content as HTML like existing notes
             content = f'<html><head></head><body style="word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;">{body}</body></html>'
             
+            collection_guid = self.collections.get(collection or "/", {}).get("guid", "root")
             note_data = {
-                "fields": {
-                    "noteId": note_id,
+                "notes": [{
+                    "guid": note_id,
                     "subject": title,
-                    "content": content,
-                    "type": "note",
-                    "folderName": collection or "/",
-                    "createdDateExtended": int(now.timestamp() * 1000),
-                    "lastModifiedDate": int(now.timestamp() * 1000),
-                    "dateModified": now_local.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "size": len(content),
+                    "body": {
+                        "content": content,
+                        "preview": body[:100]  # First 100 chars as preview
+                    },
+                    "folderId": collection_guid,
+                    "created": int(now.timestamp() * 1000),
+                    "modified": int(now.timestamp() * 1000),
                     "tags": tags or [],
-                    "isShared": False,
-                    "hasAttachments": False,
-                    "attachments": [],
-                    "order": len(self.lists[collection or '/']) + 1
-                }
+                    "pinned": False,
+                    "deleted": False,
+                    "version": 1
+                }]
             }
 
             response = self._make_request(
@@ -383,25 +450,16 @@ class NotesService:
     def create_folder(self, name: str) -> bool:
         """Create a new folder in Notes."""
         try:
-            # Generate a new UUID for the folder
             folder_id = f"{str(uuid.uuid4()).upper()}%Tm90ZXM=%{len(self.collections) + 1}"
-            now = datetime.now()
-            local_tz = pytz.timezone(get_localzone_name())
-            now_local = now.astimezone(local_tz)
             
             folder_data = {
+                "operation": "create",
+                "recordName": folder_id,
+                "recordType": "Folder",
                 "fields": {
-                    "noteId": folder_id,
-                    "subject": name,
-                    "type": "folder",
-                    "createdDateExtended": int(now.timestamp() * 1000),
-                    "lastModifiedDate": int(now.timestamp() * 1000),
-                    "dateModified": now_local.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "folderName": name,
-                    "isShared": False,
-                    "hasAttachments": False,
-                    "attachments": [],
-                    "order": len(self.collections) + 1
+                    "title": {"value": name},
+                    "parentID": {"value": "root"},
+                    "color": {"value": 7}  # Gray
                 }
             }
 

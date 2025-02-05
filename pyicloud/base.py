@@ -763,12 +763,22 @@ class PyiCloudService:
     @property
     def notes(self):
         """Gets the 'Notes' service."""
-        service_root = self._get_webservice_url("notes")
-        return NotesService(
-            session=self.session,
-            service_root=service_root,
-            max_retries=3
-        )
+        if not hasattr(self, '_notes'):
+            service_root = self._get_webservice_url("notes")
+            self._notes = NotesService(
+                session=self.session,
+                service_root=service_root,
+                params={
+                    'clientBuildNumber': '4039.6.6',  # Matches working calendar client
+                    'clientMasteringNumber': '4039B6',
+                    'clientId': self.client_id,
+                    'dsid': self.data.get("dsInfo", {}).get("dsid"),
+                    'lang': 'en-us',
+                    'usertz': get_localzone_name(),
+                    '_cloudKitVersion': '2'  # Changed from 4 → 2 (matches working services)
+                }
+            )
+        return self._notes
 
     def __str__(self):
         return f"iCloud API: {self.user.get('apple_id')}"
