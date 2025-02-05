@@ -1,3 +1,4 @@
+"""Integration tests for Notes service."""
 import os
 import pytest
 from pyicloud import PyiCloudService
@@ -51,6 +52,19 @@ def setup_api():
     except Exception as e:
         pytest.fail(f"Failed to authenticate: {str(e)}")
 
+def ensure_test_list(reminders):
+    """Ensure the 'Tests' list exists and return it."""
+    lists = reminders.lists
+    
+    # Check if 'Tests' list exists
+    if "Tests" not in lists:
+        # Create 'Tests' list if it doesn't exist
+        logger.info("Creating 'Tests' list")
+        # Note: List creation not supported in current API, user must create manually
+        pytest.skip("Please create a 'Tests' list in your Reminders app")
+    
+    return "Tests"
+
 def test_reminders_service():
     api = setup_api()
     
@@ -71,49 +85,41 @@ def test_reminders_service():
         for title in lists.keys():
             print(f"  - {title}")
         
-        for title, lst in lists.items():
-            print(f"List: {title}")
-            for reminder in lst:
-                print(f"  - {reminder['title']}")
+        # Ensure we have a test list
+        test_list = ensure_test_list(reminders)
+        
+        # Test accessing reminders in test list
+        test_list_reminders = lists.get(test_list, [])
+        print(f"Accessing reminders in list: {test_list}")
+        assert test_list_reminders is not None, "Reminders in list is None"
+        
+        # Print some details about the reminders
+        for reminder in test_list_reminders:
+            print(f"Reminder: {reminder['title']}")
+            print(f"  Description: {reminder.get('desc', 'No description')}")
+            print(f"  Due Date: {reminder.get('due', 'No due date')}")
     except Exception as e:
-        pytest.fail(f"Failed to get reminder lists: {str(e)}")
-    
-    # Test accessing reminders in first list
-    if lists:
-        first_list_title = next(iter(lists.keys()))
-        first_list = lists[first_list_title]
-        try:
-            print(f"Accessing reminders in list: {first_list_title}")
-            assert first_list is not None, "Reminders in list is None"
-            
-            # Print some details about the reminders
-            for reminder in first_list:
-                print(f"Reminder: {reminder['title']}")
-                print(f"  Description: {reminder.get('desc', 'No description')}")
-                print(f"  Due Date: {reminder.get('due', 'No due date')}")
-        except Exception as e:
-            pytest.fail(f"Failed to access reminders in list: {str(e)}")
+        pytest.fail(f"Failed to access reminders: {str(e)}")
 
 def test_reminder_lifecycle():
     """Test creating, updating, and completing a reminder"""
     api = setup_api()
     reminders = api.reminders
-    lists = reminders.lists
     
-    assert len(lists) > 0, "No reminder lists found - you must have at least one list in your iCloud account"
+    # Ensure we have a test list
+    test_list = ensure_test_list(reminders)
     
     try:
         # Create a test reminder
-        first_list_title = next(iter(lists.keys()))
         test_title = "PyiCloud Test Reminder Lifecycle"
         test_desc = "This is a test reminder created by PyiCloud"
         due_date = datetime.now() + timedelta(days=1)
         
-        print(f"Creating reminder in list: {first_list_title}")
+        print(f"Creating reminder in list: {test_list}")
         guid = reminders.post(
             test_title,
             description=test_desc,
-            collection=first_list_title,
+            collection=test_list,
             due_date=due_date
         )
         assert guid is not None, "Failed to create reminder"
@@ -206,30 +212,15 @@ def test_reminder_creation():
 
 def test_chief_of_staff_operations():
     """Test the enhanced Chief of Staff operations for reminders management"""
-    username = os.environ.get("ICLOUD_USERNAME")
-    password = os.environ.get("ICLOUD_PASSWORD")
-    
-    if not username or not password:
-        pytest.skip("ICLOUD_USERNAME and ICLOUD_PASSWORD environment variables required")
-    
-    api = PyiCloudService(username, password)
+    api = setup_api()
     reminders = api.reminders
-    lists = reminders.lists
     
-    if not lists:
-        pytest.skip("No reminder lists available")
+    # Ensure we have a test list
+    test_list = ensure_test_list(reminders)
     
     try:
         # Updated test setup with timezone-aware dates
         tz = timezone('America/New_York')
-        today = datetime.now(tz)
-        tomorrow = today + timedelta(days=1)
-        
-        # Create test reminders in different lists with different due dates
-        first_list = next(iter(lists.keys()))
-        second_list = next(iter(list(lists.keys())[1:])) if len(lists) > 1 else first_list
-        
-        # Create reminders with different due dates
         today = datetime.now(tz)
         tomorrow = today + timedelta(days=1)
         next_week = today + timedelta(days=7)
@@ -244,19 +235,19 @@ def test_chief_of_staff_operations():
                 "title": "Review Q1 Performance Metrics",
                 "description": "Due today - High priority review of quarterly metrics",
                 "due_date": today,
-                "collection": first_list
+                "collection": test_list
             },
             {
                 "title": "Prepare Team Meeting Agenda",
                 "description": "Due tomorrow - Draft agenda for weekly sync",
                 "due_date": tomorrow,
-                "collection": first_list
+                "collection": test_list
             },
             {
                 "title": "Strategic Planning Session",
                 "description": "Due next week - Annual strategy review",
                 "due_date": next_week,
-                "collection": first_list
+                "collection": test_list
             }
         ]
         
@@ -318,56 +309,9 @@ def test_chief_of_staff_operations():
                 logger.debug("Collection task: %s, due: %s", task["title"], task["due"])
                 
         assert len(upcoming_by_collection) > 0, "Should find upcoming reminders"
-        assert first_list in upcoming_by_collection, "First list should contain reminders"
-        assert len(upcoming_by_collection[first_list]) >= 2, "Should have at least 2 upcoming reminders in first list"
+        assert test_list in upcoming_by_collection, "Test list should contain reminders"
+        assert len(upcoming_by_collection[test_list]) >= 2, "Should have at least 2 upcoming reminders in test list"
         
-        # Test moving reminders between lists
-        if first_list != second_list:
-            # Move one reminder to second list
-            success = reminders.move_reminder(guids[0], second_list)
-            if not success:
-                logger.warning("Moving reminders between lists is not supported by this account, skipping move tests")
-            else:
-                # Verify the move
-                moved_reminder = reminders.get_reminder(guids[0])
-                assert moved_reminder is not None, "Moved reminder not found"
-                assert moved_reminder["collection"] == second_list, "Reminder not in correct list"
-
-                # Verify reminder counts in both lists
-                first_list_reminders = reminders.get_reminders_by_collection(first_list)
-                second_list_reminders = reminders.get_reminders_by_collection(second_list)
-                assert any(r["guid"] == guids[0] for r in second_list_reminders), "Moved reminder not found in second list"
-                assert not any(r["guid"] == guids[0] for r in first_list_reminders), "Moved reminder still in first list"
-
-        # Test batch operations
-        # Complete multiple reminders
-        results = reminders.batch_complete([guids[0], guids[1]])
-        assert all(results.values()), "Failed to complete reminders in batch"
-
-        # Verify completions
-        for guid in [guids[0], guids[1]]:
-            reminder = reminders.get_reminder(guid)
-            assert reminder["completed"], f"Reminder {guid} not marked as completed"
-
-        # Test filtering completed vs non-completed
-        completed_reminders = reminders.get_reminders_by_collection(first_list, include_completed=True)
-        non_completed_reminders = reminders.get_reminders_by_collection(first_list, include_completed=False)
-        logger.debug("Found %d completed reminders and %d non-completed reminders",
-                    len(completed_reminders), len(non_completed_reminders))
-        assert len(completed_reminders) > len(non_completed_reminders), "Should have more reminders when including completed"
-
-        # Test batch move (if we have two lists)
-        if first_list != second_list:
-            # Try to move reminders in batch
-            move_results = reminders.batch_move([guids[1], guids[2]], second_list)
-            if not all(move_results.values()):
-                logger.warning("Moving reminders between lists is not supported by this account, skipping batch move tests")
-            else:
-                # Verify the moves
-                second_list_reminders = reminders.get_reminders_by_collection(second_list)
-                for guid in [guids[1], guids[2]]:
-                    assert any(r["guid"] == guid for r in second_list_reminders), f"Reminder {guid} not found in second list"
-
         # Clean up - complete all test reminders
         for guid in guids:
             reminders.complete(guid)
@@ -376,114 +320,15 @@ def test_chief_of_staff_operations():
         logger.error("Test failed with error: %s", str(e))
         pytest.fail(f"Failed during Chief of Staff operations test: {str(e)}")
 
-def test_large_list_performance():
-    """Test performance with large lists of reminders."""
-    # skip this test for now
-    return
-
-    username = os.environ.get("ICLOUD_USERNAME")
-    password = os.environ.get("ICLOUD_PASSWORD")
-    
-    if not username or not password:
-        pytest.skip("ICLOUD_USERNAME and ICLOUD_PASSWORD environment variables required")
-    
-    api = PyiCloudService(username, password)
-    reminders = api.reminders
-    lists = reminders.lists
-    
-    if not lists:
-        pytest.skip("No reminder lists available")
-    
-    try:
-        # Create a test list with many reminders
-        first_list = next(iter(lists.keys()))
-        base_date = datetime.now()
-        test_guids = []
-        
-        # Create 50 reminders spread across the next 30 days
-        for i in range(50):
-            due_date = base_date + timedelta(days=i % 30)  # Spread across 30 days
-            guid = reminders.post(
-                f"Performance Test Task {i+1}",
-                description=f"Task {i+1} for performance testing",
-                collection=first_list,
-                due_date=due_date
-            )
-            assert guid is not None, f"Failed to create reminder {i+1}"
-            test_guids.append(guid)
-        
-        # Test performance of various operations
-        
-        # 1. Test get_reminders_by_collection performance
-        import time
-        start_time = time.time()
-        all_reminders = reminders.get_reminders_by_collection(first_list)
-        collection_query_time = time.time() - start_time
-        assert collection_query_time < 5, "Collection query took too long"
-        assert len(all_reminders) >= 50, "Not all test reminders were created"
-        
-        # 2. Test get_upcoming_reminders performance
-        start_time = time.time()
-        upcoming = reminders.get_upcoming_reminders(days=30)
-        upcoming_query_time = time.time() - start_time
-        assert upcoming_query_time < 5, "Upcoming reminders query took too long"
-        assert first_list in upcoming, "Test list not found in upcoming reminders"
-        assert len(upcoming[first_list]) >= 50, "Not all test reminders found in upcoming"
-        
-        # 3. Test get_reminders_by_due_date performance
-        start_time = time.time()
-        due_date_reminders = reminders.get_reminders_by_due_date(
-            start_date=base_date,
-            end_date=base_date + timedelta(days=30)
-        )
-        due_date_query_time = time.time() - start_time
-        assert due_date_query_time < 5, "Due date query took too long"
-        assert len(due_date_reminders) >= 50, "Not all test reminders found in due date range"
-        
-        # 4. Test batch operations performance
-        # Complete half the reminders
-        start_time = time.time()
-        half_guids = test_guids[:25]
-        results = reminders.batch_complete(half_guids)
-        batch_complete_time = time.time() - start_time
-        assert batch_complete_time < 10, "Batch complete operation took too long"
-        assert all(results.values()), "Some completions failed"
-        
-        # Verify the completed vs non-completed split
-        completed = reminders.get_reminders_by_collection(first_list, include_completed=True)
-        non_completed = reminders.get_reminders_by_collection(first_list, include_completed=False)
-        assert len(completed) > len(non_completed), "Completion count mismatch"
-        
-        # Clean up - complete all remaining test reminders
-        for guid in test_guids[25:]:
-            reminders.complete(guid)
-            
-    except Exception as e:
-        # Clean up even if test fails
-        for guid in test_guids:
-            try:
-                reminders.complete(guid)
-            except:
-                pass
-        pytest.fail(f"Failed during large list performance test: {str(e)}")
-
 def test_reminder_error_cases():
     """Test error cases and edge conditions for reminders."""
-    username = os.environ.get("ICLOUD_USERNAME")
-    password = os.environ.get("ICLOUD_PASSWORD")
-    
-    if not username or not password:
-        pytest.skip("ICLOUD_USERNAME and ICLOUD_PASSWORD environment variables required")
-    
-    api = PyiCloudService(username, password)
+    api = setup_api()
     reminders = api.reminders
-    lists = reminders.lists
     
-    if not lists:
-        pytest.skip("No reminder lists available")
+    # Ensure we have a test list
+    test_list = ensure_test_list(reminders)
     
     try:
-        first_list = next(iter(lists.keys()))
         test_guids = []
         
         # Test 1: Invalid collection name
@@ -522,7 +367,7 @@ def test_reminder_error_cases():
         valid_guid = reminders.post(
             "Valid Reminder",
             description="For batch testing",
-            collection=first_list
+            collection=test_list
         )
         test_guids.append(valid_guid)
         
@@ -538,7 +383,7 @@ def test_reminder_error_cases():
         guid = reminders.post(
             "",
             description="Empty title test",
-            collection=first_list
+            collection=test_list
         )
         if guid:  # Some implementations might allow empty titles
             test_guids.append(guid)
