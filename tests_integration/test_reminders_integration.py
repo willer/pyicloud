@@ -110,10 +110,11 @@ def test_reminder_lifecycle():
     test_list = ensure_test_list(reminders)
     
     try:
-        # Create a test reminder
+        # Create a test reminder with timezone-aware dates
         test_title = "PyiCloud Test Reminder Lifecycle"
         test_desc = "This is a test reminder created by PyiCloud"
-        due_date = datetime.now() + timedelta(days=1)
+        tz = timezone('America/New_York')
+        due_date = datetime.now(tz) + timedelta(days=1)
         
         print(f"Creating reminder in list: {test_list}")
         guid = reminders.post(
@@ -132,10 +133,10 @@ def test_reminder_lifecycle():
         assert reminder["desc"] == test_desc, "Description does not match"
         assert reminder["due"].date() == due_date.date(), "Due date does not match"
         
-        # Update the reminder
+        # Update the reminder with timezone-aware dates
         new_title = "Updated Test Reminder"
         new_desc = "This reminder has been updated"
-        new_due_date = datetime.now() + timedelta(days=2)
+        new_due_date = datetime.now(tz) + timedelta(days=2)
         
         success = reminders.update(
             guid,

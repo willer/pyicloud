@@ -441,6 +441,7 @@ class WebRemindersService:
             }
         }
 
+        utc_date = None
         if due_date is not None:
             if not due_date.tzinfo:
                 local_tz = pytz.timezone(get_localzone_name())
@@ -463,7 +464,7 @@ class WebRemindersService:
             current.update({
                 "title": update_data["fields"]["title"],
                 "desc": update_data["fields"]["description"],
-                "due": due_date if due_date is not None else current.get("due"),
+                "due": utc_date if utc_date is not None else current.get("due"),
                 "priority": update_data["fields"]["priority"],
                 "tags": update_data["fields"]["tags"],
                 "p_guid": pguid,
