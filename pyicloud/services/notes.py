@@ -1,6 +1,7 @@
 """Notes service."""
 from datetime import datetime
 import logging
+import re
 import uuid
 from typing import List, Dict, Optional, Union, Any
 import json
@@ -33,9 +34,10 @@ class NotesService:
         self._service_root = service_root
         self._max_retries = max_retries
         self.collections = {}  # Folders by name
-        self.lists = defaultdict(list)  # Notes by folder name
+        self.lists = defaultdict(list)  # Notes by GUID
         self._notes_by_guid = {}  # Notes by GUID
         self._tags = set()  # All unique tags
+        self._default_folder = "Notes"  # Default folder if none exists
 
         # Get web token from session
         web_token = session.service.data.get("dsInfo", {}).get("dsid")
@@ -45,11 +47,11 @@ class NotesService:
         # Extract host from service_root
         host = service_root.split("://")[1].split(":")[0]
 
-        # Set up headers with working calendar service values
+        # Set up headers with consistent API versions
         self.session.headers.update({
             'X-Apple-Auth-Token': session.service.session_data.get('session_token'),
             'X-Apple-Time-Zone': get_localzone_name(),
-            'X-Apple-CloudKit-Request-ISO8601Timestamp': datetime.utcnow().isoformat(),
+            'X-Apple-CloudKit-Request-ISO8601Timestamp': datetime.utcnow().isoformat() + 'Z',
             'X-Apple-CloudKit-Request-Context': 'notes',
             'X-Apple-CloudKit-Request-Environment': 'production',
             'X-Apple-CloudKit-Request-SigningVersion': '3',
@@ -58,23 +60,23 @@ class NotesService:
             'X-Apple-CloudKit-Request-Schema': 'chunked:3',
             'Accept': 'application/json',
             'Content-Type': 'application/json',
-            'Host': host,  # Use the correct host from service_root
+            'Host': host,
             'Origin': 'https://www.icloud.com',
             'Referer': 'https://www.icloud.com/'
         })
         
-        # Add service-specific parameters for iOS 13+ format
+        # Add service-specific parameters with consistent API versions
         self.params = {
-            "clientBuildNumber": "2401Project45",  # Updated to latest known version
-            "clientMasteringNumber": "2401B45",
+            "clientBuildNumber": "4039.6.6",
+            "clientMasteringNumber": "4039B6",
             "clientId": session.service.client_id,
             "dsid": session.service.data.get("dsInfo", {}).get("dsid"),
             "lang": "en-us",
             "usertz": get_localzone_name(),
-            "notesWebUIVersion": "3.0",  # Updated to latest version
-            "_cloudKitVersion": "3",  # Updated to latest version
+            "notesWebUIVersion": "3.0",
+            "_cloudKitVersion": "3",
             "requestID": str(uuid.uuid4()).upper(),
-            "schema": "chunked:3"  # Updated to latest version
+            "schema": "chunked:3"
         }
         if params:
             self.params.update(params)
@@ -113,24 +115,47 @@ class NotesService:
         while retry_count < max_retries:
             try:
                 logger.debug(f"Making {method} request to {endpoint}")
-                request_params = {**self.params, **(params or {})}
                 
-                # Add required headers for iOS 13+ format
+                # Generate a single requestID for both URL params and body
+                request_id = str(uuid.uuid4()).upper()
+                
+                # Get current time in correct format
+                now = datetime.utcnow()
+                timestamp_z = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'  # Truncate microseconds to 3 digits
+                
+                # Start with base params and ensure consistency
+                request_params = {
+                    **self.params,
+                    "requestID": request_id,  # Use the same requestID
+                    "_cloudKitVersion": "2"  # Ensure this is always 2
+                }
+                if params:
+                    request_params.update(params)
+                    request_params["requestID"] = request_id  # Ensure it's not overwritten
+                
+                # Ensure data consistency
+                if data and isinstance(data, dict):
+                    data = {**data}  # Make a copy to avoid modifying the original
+                    data["_cloudKitVersion"] = "2"  # Ensure this is always 2
+                    data["requestID"] = request_id  # Use the same requestID
+                    data["schema"] = "chunked:3"
+                
+                # Add required headers with consistent timestamps
                 headers = {
                     'X-Apple-Web-Token': self.session.service.session_data.get('session_token'),
                     'X-Apple-Time-Zone': get_localzone_name(),
-                    'X-Apple-CloudKit-Request-ISO8601Timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+                    'X-Apple-CloudKit-Request-ISO8601Timestamp': timestamp_z,
                     'X-Apple-CloudKit-Request-Context': 'notes',
                     'X-Apple-CloudKit-Request-Environment': 'production',
                     'X-Apple-CloudKit-Request-SigningVersion': '3',
                     'X-Apple-CloudKit-Request-KeyID': self.session.service.client_id,
                     'X-Apple-CloudKit-Request-Container': 'com.apple.notes',
                     'X-Apple-CloudKit-Request-Schema': 'chunked:3',
-                    'X-Apple-I-ClientTime': datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f%z'),
+                    'X-Apple-I-ClientTime': timestamp_z,  # Use same format
                     'Host': self._service_root.split("://")[1].split(":")[0],
                     'X-Apple-I-Web-Token': self.session.service.session_data.get('session_token'),
                     'X-Apple-Routing-Key': f"{self.params['dsid']}:0:notes",
-                    'X-Apple-I-Protocol-Version': "3.0",
+                    'X-Apple-I-Protocol-Version': "2.0",  # Match CloudKit version
                     'Accept': 'application/json',
                     'Content-Type': 'application/json',
                     'Origin': 'https://www.icloud.com',
@@ -142,6 +167,11 @@ class NotesService:
                 logger.debug(f"Request params: {request_params}")
                 logger.debug(f"Request headers: {headers}")
                 
+                logger.debug("Making request - URL: %s, method: %s, params: %s, data: %s", 
+                           url, method, request_params, data)
+                logger.debug("Request headers: %s", headers)
+                logger.debug("Auth token: %s", self.session.service.session_data.get("session_token"))
+
                 if method.lower() == 'get':
                     response = self.session.get(
                         url,
@@ -152,13 +182,13 @@ class NotesService:
                 else:
                     response = self.session.post(
                         url,
-                        json=data,  # Changed from data=json.dumps(data)
+                        json=data,  # Ensure JSON encoding
                         params=request_params,
                         timeout=timeout,
                         headers=headers
                     )
                 
-                logger.debug(f"Response status: {response.status_code}")
+                logger.debug("Response status: %d", response.status_code)
                 logger.debug(f"Response headers: {response.headers}")
                 logger.debug(f"Response body: {response.text}")
                 
@@ -204,12 +234,13 @@ class NotesService:
                 
             except Exception as e:
                 last_error = e
-                logger.error(f"Request failed: {str(e)}")
+                logger.error("Request failed - URL: %s, method: %s, params: %s, headers: %s, error: %s",
+                           url, method, request_params, headers, str(e))
                 retry_count += 1
                 if retry_count < max_retries:
                     time.sleep(2 ** retry_count)  # Exponential backoff
                     continue
-                raise NonRetryableError(str(e))
+                raise NonRetryableError(f"Request failed after {max_retries} retries: {str(e)}")
                 
         if last_error:
             raise NonRetryableError(f"Max retries exceeded: {str(last_error)}")
@@ -319,89 +350,70 @@ class NotesService:
             return False
 
     def create(self, title: str, body: str, collection: Optional[str] = None,
-                tags: Optional[List[str]] = None, pguid: Optional[str] = None) -> Optional[str]:
+               tags: Optional[List[str]] = None, pguid: Optional[str] = None) -> Optional[str]:
         """Create a new note."""
         try:
-            # Get collection GUID from server data
-            collection_data = self.collections.get(collection or "/", {})
-            if not collection_data:
-                collection_data = next(iter(self.collections.values()))
-            collection_guid = collection_data["guid"]
+            # Ensure collection exists, fallback to default if not
+            if collection and collection not in self.collections:
+                logger.warning(f"Collection {collection} not found, using default folder")
+                collection = self._default_folder
+            elif not collection:
+                collection = self._default_folder
 
-            now = datetime.now()
-            local_tz = pytz.timezone(get_localzone_name())
-            now_local = now.astimezone(local_tz)
-            
-            # Format the content as HTML like existing notes
-            content = f'<html><head><meta charset="UTF-8"><meta name="apple-notes-version" content="3.0"><meta name="apple-notes-editable" content="true"></head><body style="word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;">{body}</body></html>'
-            
-            note_id = str(uuid.uuid4()).upper()
+            # Generate unique IDs
+            note_guid = str(uuid.uuid4()).upper()
+            identifier = str(uuid.uuid4()).upper()
+
+            # Format the content as HTML if not already HTML
+            if not body.startswith('<html>'):
+                body = f'<html><head><meta charset="UTF-8"><meta name="apple-notes-version" content="3.0"><meta name="apple-notes-editable" content="true"></head><body style="word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;">{body}</body></html>'
+
+            # Get current time in correct format
+            now = datetime.utcnow()
+            timestamp_z = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'  # Truncate microseconds to 3 digits
+
+            # Prepare note data
             note_data = {
-                "requestID": str(uuid.uuid4()).upper(),
-                "schema": "chunked:3",  # Updated schema version
-                "_cloudKitVersion": "3",  # Updated CloudKit version
-                "notes": [{
-                    "identifier": str(uuid.uuid4()).upper(),
-                    "noteGuid": str(uuid.uuid4()).upper(),
-                    "subject": title,
-                    "content": content,
-                    "folderName": collection or "/",
-                    "folderGuid": collection_guid,
-                    "createdDate": now_local.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),  # Added milliseconds
-                    "lastModifiedDate": now_local.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),  # Added milliseconds
-                    "tags": tags or [],
-                    "type": "note",
-                    "deleted": False,
-                    "version": 1,
-                    "contentLength": len(content),
-                    "isShared": False,
-                    "hasAttachments": False,
-                    "format": "html",
-                    "encoding": "UTF-8",
-                    "status": "active"
-                }]
+                "identifier": identifier,
+                "noteGuid": note_guid,
+                "subject": title,
+                "content": body,
+                "folderName": collection,
+                "folderGuid": self.collections.get(collection, {}).get("guid", "root"),
+                "createdDate": timestamp_z,  # Use consistent format
+                "lastModifiedDate": timestamp_z,  # Use consistent format
+                "tags": tags or [],
+                "type": "note",
+                "deleted": False,
+                "version": 1,
+                "contentLength": len(body),
+                "isShared": False,
+                "hasAttachments": False,
+                "format": "html",
+                "encoding": "UTF-8",
+                "status": "active"
+            }
+
+            # Make request with consistent API versions
+            request_data = {
+                "notes": [note_data]  # Let _make_request handle requestID and version
             }
 
             response = self._make_request(
                 "post",
                 "/no/content",
-                data=note_data,
-                timeout=REQUEST_TIMEOUT
+                data=request_data
             )
 
-            if response and 'notes' in response:
-                created_note = response['notes'][0]
-                note_id = created_note.get('noteGuid')
-                # Update local cache with server data
-                cache_data = {
-                    "guid": note_id,
-                    "identifier": created_note.get('identifier'),
-                    "subject": title,
-                    "content": content,
-                    "folderName": collection or "/",
-                    "folderGuid": collection_guid,
-                    "tags": tags or [],
-                    "createdDate": created_note.get('createdDate'),
-                    "lastModifiedDate": created_note.get('lastModifiedDate'),
-                    "contentLength": len(content),
-                    "isShared": False,
-                    "hasAttachments": False,
-                    "format": "html",
-                    "encoding": "UTF-8",
-                    "status": "active",
-                    "version": 1
-                }
-                self._notes_by_guid[note_id] = cache_data
-                self.lists[collection or "/"].append(cache_data)
-                if tags:
-                    self._tags.update(tags)
-                return note_id
+            if response and response.get("status", 0) == 0:
+                self._notes_by_guid[note_guid] = note_data
+                self.lists[collection].append(note_data)
+                return note_guid
 
-        except NonRetryableError as e:
-            logger.error(f"Failed to create note: {str(e)}")
         except Exception as e:
-            logger.error(f"Unexpected error creating note: {str(e)}")
-            
+            logger.error("Failed to create note: %s", str(e))
+            raise
+
         return None
 
     def get_note(self, note_id: str) -> Optional[Dict]:
@@ -455,6 +467,9 @@ class NotesService:
                 self._notes_by_guid[note_id] = note_data
                 if note_data['tags']:
                     self._tags.update(note_data['tags'])
+                note_data["body"] = re.sub('<[^<]+?>', '', note_data.get("content", "")).strip()
+                # Ensure the note data includes the expected "collection" key
+                note_data["collection"] = note_data.get("folderName", "/")
                 return note_data
 
             # Fallback to local cache if server request fails
@@ -530,6 +545,9 @@ class NotesService:
                     "encoding": "UTF-8",
                     "status": "active"
                 })
+                current["body"] = re.sub('<[^<]+?>', '', current.get("content", "")).strip()
+                # Also add the "collection" key using the folderName from the current cache
+                current["collection"] = current.get("folderName", "/")
                 
                 # Update tags set
                 if tags:
@@ -640,6 +658,7 @@ class NotesService:
                         "guid": note.get('identifier') or note.get('noteGuid'),
                         "title": note.get('title') or note.get('subject', ''),
                         "folderName": collection,
+                        "collection": collection,
                         "folderGuid": collection_guid,
                         "size": note.get('contentLength') or note.get('size', 0),
                         "modified": note.get('lastModifiedDate'),

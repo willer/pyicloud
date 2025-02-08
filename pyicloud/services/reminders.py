@@ -169,36 +169,57 @@ class EventKitRemindersService:
             components = reminder.dueDateComponents()
             date = NSCalendar.currentCalendar().dateFromComponents_(components)
             if date:
-                result['due'] = datetime.fromtimestamp(date.timeIntervalSince1970())
+                # Convert timestamp to datetime in UTC
+                dt = datetime.utcfromtimestamp(date.timeIntervalSince1970())
+                # Ensure timezone is set to UTC
+                result['due'] = pytz.UTC.localize(dt)
 
         return result
 
     def post(self, title: str, description: str = "", collection: Optional[str] = None,
              priority: int = 0, tags: List[str] = None,
              due_date: Optional[datetime] = None) -> Optional[str]:
-        """Create a new reminder."""
+        """Create a new reminder.
+        
+        Args:
+            title: Title of the reminder
+            description: Optional description
+            collection: Optional collection name (defaults to first available)
+            priority: Optional priority level (0-4)
+            tags: Optional list of tags
+            due_date: Optional due date
+            
+        Returns:
+            str: GUID of created reminder if successful
+            
+        Raises:
+            PyiCloudException: If creation fails for any reason
+        """
         try:
+            # Validate and format due date if provided
+            if due_date is not None:
+                if not isinstance(due_date, datetime):
+                    raise PyiCloudException("due_date must be a datetime object")
+                if due_date.tzinfo is None:
+                    # Localize naive datetime to UTC
+                    due_date = pytz.UTC.localize(due_date)
+
+            # Validate collection
+            collection = self._validate_collection(collection)
+            calendar = self._calendar_for_name(collection)
+            if not calendar:
+                raise PyiCloudException(f"Calendar not found: {collection}")
+
+            # Create the reminder
             reminder = EKReminder.reminderWithEventStore_(self.store)
             reminder.setTitle_(title)
-            reminder.setNotes_(description or "")
+            reminder.setNotes_(description)
             reminder.setPriority_(priority)
-
-            if collection:
-                calendar = None
-                for cal in self._calendars:
-                    if cal.title() == collection:
-                        calendar = cal
-                        break
-                if calendar:
-                    reminder.setCalendar_(calendar)
-                else:
-                    # Use first available calendar if specified one not found
-                    reminder.setCalendar_(self._calendars[0])
-            else:
-                # Use first available calendar
-                reminder.setCalendar_(self._calendars[0])
+            reminder.setCalendar_(calendar)
 
             if due_date:
+                if due_date.tzinfo is not None:
+                    due_date = due_date.astimezone(pytz.UTC)
                 components = NSDateComponents.alloc().init()
                 components.setYear_(due_date.year)
                 components.setMonth_(due_date.month)
@@ -208,16 +229,17 @@ class EventKitRemindersService:
                 components.setSecond_(due_date.second)
                 reminder.setDueDateComponents_(components)
 
+            # Save the reminder
             success, error = self.store.saveReminder_commit_error_(reminder, True, None)
-            if success:
-                return str(reminder.calendarItemIdentifier())
-            else:
-                LOGGER.error(f"Failed to save reminder: {error}")
+            if not success:
+                error_msg = str(error) if error else "Unknown error"
+                raise PyiCloudException(f"Failed to save reminder: {error_msg}")
+
+            return str(reminder.calendarItemIdentifier())
 
         except Exception as e:
-            LOGGER.error(f"Failed to create reminder: {str(e)}")
-
-        return None
+            LOGGER.error("Failed to create reminder: %s", str(e))
+            raise PyiCloudException(f"Failed to create reminder: {str(e)}")
 
     def update(self, guid: str, title: Optional[str] = None,
                description: Optional[str] = None, due_date: Optional[datetime] = None,
@@ -241,6 +263,15 @@ class EventKitRemindersService:
                     reminder.setCalendar_(calendar)
 
             if due_date:
+                if not isinstance(due_date, datetime):
+                    raise PyiCloudException("due_date must be a datetime object")
+                if due_date.tzinfo is None:
+                    # Localize naive datetime to UTC
+                    due_date = pytz.UTC.localize(due_date)
+                else:
+                    # Convert to UTC if in another timezone
+                    due_date = due_date.astimezone(pytz.UTC)
+
                 components = NSDateComponents.alloc().init()
                 components.setYear_(due_date.year)
                 components.setMonth_(due_date.month)
@@ -411,6 +442,42 @@ class EventKitRemindersService:
             result[reminder['collection']].append(reminder)
         return dict(result)
 
+    def _validate_collection(self, collection: Optional[str]) -> str:
+        """Validate and return a collection name.
+        
+        Args:
+            collection: Optional collection name
+            
+        Returns:
+            str: Valid collection name (defaults to first available)
+            
+        Raises:
+            PyiCloudException: If no valid collection is available
+        """
+        if not self._calendars:
+            self.refresh()
+            
+        if not self._calendars:
+            raise PyiCloudException("No reminder lists available")
+            
+        # If no collection specified, use first available
+        if not collection:
+            LOGGER.warning("Using default collection %s", self._calendars[0].title())
+            return self._calendars[0].title()
+            
+        # Verify collection exists
+        for calendar in self._calendars:
+            if calendar.title() == collection:
+                return collection
+                
+        # Collection not found, use first available
+        LOGGER.warning(
+            "Collection %s not found, using default collection %s",
+            collection,
+            self._calendars[0].title()
+        )
+        return self._calendars[0].title()
+
 class RemindersService:
     """The 'Reminders' iCloud service."""
 
@@ -423,6 +490,7 @@ class RemindersService:
         self.session = session
         self.params = params
         self._service_root = service_root
+        self.token_expiry = 0  # Initialize token expiry
         
         # Use EventKit on macOS
         if sys.platform == 'darwin':
@@ -437,9 +505,44 @@ class RemindersService:
 
     def post(self, title: str, description: str = "", collection: Optional[str] = None,
              priority: int = 0, tags: List[str] = None,
-             due_date: Optional[datetime] = None, **kwargs) -> Optional[str]:
-        """Create a new reminder."""
-        return self._impl.post(title, description, collection, priority, tags, due_date)
+             due_date: Optional[datetime] = None) -> Optional[str]:
+        """Create a new reminder.
+        
+        Args:
+            title: Title of the reminder
+            description: Optional description
+            collection: Optional collection name (defaults to first available)
+            priority: Optional priority level (0-4)
+            tags: Optional list of tags
+            due_date: Optional due date
+            
+        Returns:
+            str: GUID of created reminder if successful
+            
+        Raises:
+            PyiCloudException: If creation fails for any reason
+        """
+        try:
+            # Validate and format due date if provided
+            if due_date is not None:
+                if not isinstance(due_date, datetime):
+                    raise PyiCloudException("due_date must be a datetime object")
+                if due_date.tzinfo is None:
+                    # Localize naive datetime to UTC
+                    due_date = pytz.UTC.localize(due_date)
+
+            # Validate collection
+            collection = self._validate_collection(collection)
+
+            # Create the reminder using implementation
+            guid = self._impl.post(title, description, collection, priority, tags, due_date)
+            if guid is None:
+                raise PyiCloudException("Failed to create reminder - no GUID returned")
+            return guid
+
+        except Exception as e:
+            LOGGER.error("Failed to create reminder: %s", str(e))
+            raise PyiCloudException(f"Failed to create reminder: {str(e)}")
 
     def get_reminder(self, guid: str) -> Optional[Dict]:
         """Get a reminder by its GUID."""
@@ -606,20 +709,29 @@ class RemindersService:
                 LOGGER.debug(f"Making {method} request to {endpoint}")
                 request_params = {**self.params, **(params or {})}
                 
+                url = f"{self._service_root}{endpoint}"
+                LOGGER.debug("Making request - URL: %s, method: %s, params: %s, data: %s",
+                           url, method, request_params, data)
+                LOGGER.debug("Auth token: %s", self.session.service.session_data.get("session_token"))
+
                 if method.lower() == 'get':
                     response = self.session.get(
-                        f"{self._service_root}{endpoint}",
+                        url,
                         params=request_params,
                         timeout=timeout
                     )
                 else:
                     response = self.session.post(
-                        f"{self._service_root}{endpoint}",
-                        data=json.dumps(data) if data else None,
+                        url,
+                        json=data,  # Changed to use json parameter
                         params=request_params,
                         timeout=timeout
                     )
-                    
+                
+                LOGGER.debug("Response status: %d", response.status_code)
+                LOGGER.debug("Response headers: %s", response.headers)
+                LOGGER.debug("Response body: %s", response.text)
+                
                 # Handle different error cases
                 if response.status_code == 401:
                     LOGGER.debug("Got 401, attempting auth refresh")
@@ -653,12 +765,13 @@ class RemindersService:
                 
             except Exception as e:
                 last_error = e
-                LOGGER.error(f"Request failed: {str(e)}")
+                LOGGER.error("Request failed - URL: %s, method: %s, params: %s, error: %s",
+                           url, method, request_params, str(e))
                 retry_count += 1
                 if retry_count < max_retries:
                     time.sleep(2 ** retry_count)  # Exponential backoff
                     continue
-                raise NonRetryableError(str(e))
+                raise NonRetryableError(f"Request failed after {max_retries} retries: {str(e)}")
                 
         if last_error:
             raise NonRetryableError(f"Max retries exceeded: {str(last_error)}")
@@ -766,3 +879,59 @@ class RemindersService:
             utc_date.minute,
             utc_date.second
         ]
+
+    def create_list(self, name: str, color: Optional[str] = None) -> bool:
+        """Create a new reminder list.
+        
+        Args:
+            name: The name of the list to create
+            color: Optional color for the list (hex code or name)
+            
+        Returns:
+            bool: True if list was created successfully, False otherwise
+        """
+        try:
+            if not name:
+                LOGGER.error("List name cannot be empty")
+                return False
+
+            # Format the request data according to iCloud API requirements
+            list_data = {
+                "Collection": {
+                    "title": name,
+                    "type": "com.apple.reminders.list",
+                    "color": color if color else "#FF9500",  # Default orange color if none specified
+                    "createdDate": int(time.time() * 1000),  # Current time in milliseconds
+                    "enabled": True
+                }
+            }
+
+            # Make the request
+            for _ in range(3):  # Try up to 3 times
+                try:
+                    response = self._make_request(
+                        "POST",
+                        "/rl/collections",
+                        data=list_data
+                    )
+
+                    if response and isinstance(response, dict) and response.get("Collection"):
+                        # Update local cache
+                        self.lists[name] = []
+                        return True
+
+                    LOGGER.error("Failed to create list, response: %s", response)
+                    return False
+
+                except RetryableError:
+                    continue
+                except NonRetryableError as e:
+                    LOGGER.error("Non-retryable error creating list: %s", str(e))
+                    return False
+
+            LOGGER.error("Failed to create list after 3 retries")
+            return False
+
+        except Exception as e:
+            LOGGER.error("Failed to create list: %s", str(e))
+            return False

@@ -22,7 +22,7 @@ def ensure_test_folder(notes):
                 return "Test"
         # If we can't create it, use the default folder
         logger.info("Using default Notes folder")
-        return next(iter(lists.keys()), "Notes")
+        return notes._default_folder
     
     return "Test"
 
@@ -39,17 +39,17 @@ def test_chief_of_staff_operations(notes):
         test_notes = [
             {
                 "title": "Meeting Notes: Q1 Review",
-                "body": "Key points to discuss:\n1. Performance metrics\n2. Project status\n3. Next quarter goals",
+                "body": "<html><head><meta charset=\"UTF-8\"><meta name=\"apple-notes-version\" content=\"3.0\"><meta name=\"apple-notes-editable\" content=\"true\"></head><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;\">Key points to discuss:\n1. Performance metrics\n2. Project status\n3. Next quarter goals</body></html>",
                 "tags": ["meeting", "quarterly-review"]
             },
             {
                 "title": "Project Brainstorm",
-                "body": "Ideas for new features:\n- AI integration\n- Better sync\n- Improved UI",
+                "body": "<html><head><meta charset=\"UTF-8\"><meta name=\"apple-notes-version\" content=\"3.0\"><meta name=\"apple-notes-editable\" content=\"true\"></head><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;\">Ideas for new features:\n- AI integration\n- Better sync\n- Improved UI</body></html>",
                 "tags": ["project", "planning"]
             },
             {
                 "title": "Action Items",
-                "body": "TODO:\n1. Follow up with team\n2. Schedule next meeting\n3. Send summary",
+                "body": "<html><head><meta charset=\"UTF-8\"><meta name=\"apple-notes-version\" content=\"3.0\"><meta name=\"apple-notes-editable\" content=\"true\"></head><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;\">TODO:\n1. Follow up with team\n2. Schedule next meeting\n3. Send summary</body></html>",
                 "tags": ["todo", "follow-up"]
             }
         ]
@@ -68,16 +68,16 @@ def test_chief_of_staff_operations(notes):
             # Verify the note was created correctly
             created_note = notes.get_note(note_id)
             assert created_note is not None, f"Could not find created note: {note['title']}"
-            assert created_note["title"] == note["title"], "Title mismatch"
-            assert created_note["body"] == note["body"], "Body mismatch"
-            assert created_note["collection"] == test_folder, "Collection mismatch"
+            assert created_note["subject"] == note["title"], "Title mismatch"
+            assert created_note["content"] == note["body"], "Body mismatch"
+            assert created_note["folderName"] == test_folder, "Collection mismatch"
             assert set(created_note["tags"]) == set(note["tags"]), "Tags mismatch"
             logger.debug("Created note: %s", created_note)
         
         # Test searching notes
         search_results = notes.search("quarterly-review")
         assert len(search_results) >= 1, "Should find note with 'quarterly-review' tag"
-        assert any(note["title"] == "Meeting Notes: Q1 Review" for note in search_results)
+        assert any(note["subject"] == "Meeting Notes: Q1 Review" for note in search_results)
         
         # Test getting notes by collection
         test_folder_notes = notes.get_notes_by_collection(test_folder)
@@ -85,7 +85,7 @@ def test_chief_of_staff_operations(notes):
         
         # Test updating a note
         update_id = note_ids[0]
-        updated_body = test_notes[0]["body"] + "\n4. Review budget"
+        updated_body = test_notes[0]["body"].replace("</body></html>", "\n4. Review budget</body></html>")
         success = notes.update(
             update_id,
             body=updated_body
@@ -94,7 +94,7 @@ def test_chief_of_staff_operations(notes):
         
         # Verify the update
         updated_note = notes.get_note(update_id)
-        assert updated_note["body"] == updated_body, "Body not updated correctly"
+        assert updated_note["content"] == updated_body, "Body not updated correctly"
         
         # Clean up - delete test notes
         for note_id in note_ids:
@@ -125,15 +125,15 @@ def test_notes_error_cases(notes):
         
         # Test 1: Invalid collection name
         note_id = notes.create(
-            "Test Note",
-            "Test body",
-            collection="NonexistentFolder"  # Should fall back to Test folder
+            title="Test Note",
+            body="<html><head><meta charset=\"UTF-8\"><meta name=\"apple-notes-version\" content=\"3.0\"><meta name=\"apple-notes-editable\" content=\"true\"></head><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;\">Test body</body></html>",
+            collection="NonexistentFolder"  # Should fall back to default folder
         )
-        assert note_id is not None, "Should create note in test folder when collection is invalid"
+        assert note_id is not None, "Should create note in default folder when collection is invalid"
         test_ids.append(note_id)
         
         created_note = notes.get_note(note_id)
-        assert created_note["collection"] == test_folder, "Note should be created in test folder"
+        assert created_note["folderName"] == notes._default_folder, "Note should be created in default folder"
         
         # Test 2: Get nonexistent note
         nonexistent_note = notes.get_note("nonexistent-id")
@@ -149,8 +149,8 @@ def test_notes_error_cases(notes):
         
         # Test 5: Empty title/body
         note_id = notes.create(
-            "",  # Empty title
-            "Note with empty title",
+            title="",  # Empty title
+            body="<html><head><meta charset=\"UTF-8\"><meta name=\"apple-notes-version\" content=\"3.0\"><meta name=\"apple-notes-editable\" content=\"true\"></head><body style=\"word-wrap: break-word; -webkit-nbsp-mode: space; -webkit-line-break: after-white-space;\">Note with empty title</body></html>",
             collection=test_folder
         )
         if note_id:  # Some implementations might allow empty titles

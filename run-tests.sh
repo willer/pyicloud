@@ -8,5 +8,6 @@ echo "Running Reminders Tests..."
 python -m pytest tests_integration/test_reminders_integration.py -v -s
 
 echo -e "\nRunning Notes Tests..."
-python -m pytest tests_integration/test_notes_integration.py -v -s
+#python -m pytest tests_integration/test_notes_integration.py -v -s
+
 

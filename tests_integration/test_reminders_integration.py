@@ -5,7 +5,7 @@ from pyicloud import PyiCloudService
 import logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from pytz import timezone
+from pytz import timezone, UTC
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG,
@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
+
+def normalize_date_for_comparison(dt):
+    """Convert a datetime to UTC and normalize it for comparison."""
+    if dt.tzinfo is None:
+        dt = UTC.localize(dt)
+    return dt.astimezone(UTC).replace(microsecond=0)
 
 def handle_2fa(api):
     """Handle 2FA verification if needed"""
@@ -131,7 +137,11 @@ def test_reminder_lifecycle():
         assert reminder is not None, "Could not find newly created reminder"
         assert reminder["title"] == test_title, "Title does not match"
         assert reminder["desc"] == test_desc, "Description does not match"
-        assert reminder["due"].date() == due_date.date(), "Due date does not match"
+        
+        # Compare dates in UTC
+        reminder_due = normalize_date_for_comparison(reminder["due"])
+        expected_due = normalize_date_for_comparison(due_date)
+        assert reminder_due.date() == expected_due.date(), f"Due date does not match. Got {reminder_due}, expected {expected_due}"
         
         # Update the reminder with timezone-aware dates
         new_title = "Updated Test Reminder"
@@ -152,7 +162,9 @@ def test_reminder_lifecycle():
             for reminder in lst:
                 if reminder["title"] == new_title:
                     assert reminder["desc"] == new_desc, "Updated description does not match"
-                    assert reminder["due"].date() == new_due_date.date(), "Updated due date does not match"
+                    reminder_due = normalize_date_for_comparison(reminder["due"])
+                    expected_due = normalize_date_for_comparison(new_due_date)
+                    assert reminder_due.date() == expected_due.date(), f"Updated due date does not match. Got {reminder_due}, expected {expected_due}"
                     found_updated = True
                     guid = reminder["guid"]  # Update GUID to the new reminder
                     break
@@ -268,9 +280,11 @@ def test_chief_of_staff_operations():
             assert created_reminder is not None, f"Could not find created reminder: {reminder['title']}"
             assert created_reminder["title"] == reminder["title"], "Title mismatch"
             assert created_reminder["desc"] == reminder["description"], "Description mismatch"
-            logger.debug("Created reminder due date: %s, expected: %s", 
-                        created_reminder["due"], reminder["due_date"])
-            assert created_reminder["due"].date() == reminder["due_date"].date(), "Due date mismatch"
+            
+            # Compare dates in UTC
+            reminder_due = normalize_date_for_comparison(created_reminder["due"])
+            expected_due = normalize_date_for_comparison(reminder["due_date"])
+            assert reminder_due.date() == expected_due.date(), f"Due date mismatch. Got {reminder_due}, expected {expected_due}"
         
         # Test get_reminders_by_due_date with various date ranges
         # Test today's reminders
@@ -403,3 +417,47 @@ def test_reminder_error_cases():
             except:
                 pass
         pytest.fail(f"Failed during error cases test: {str(e)}")
+
+def test_list_creation():
+    """Test creating and verifying reminder lists."""
+    api = setup_api()
+    reminders = api.reminders
+    
+    try:
+        # Get initial list count
+        initial_lists = reminders.lists
+        initial_count = len(initial_lists)
+        
+        # Create a test list with a unique name
+        test_list_name = f"Test List {datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        success = reminders.create_list(test_list_name)
+        assert success, "Failed to create reminder list"
+        
+        # Refresh lists
+        reminders.refresh()
+        
+        # Verify the list was created
+        lists = reminders.lists
+        assert len(lists) == initial_count + 1, "List count did not increase"
+        assert test_list_name in lists, f"Could not find newly created list: {test_list_name}"
+        
+        # Create a list with a custom color
+        colored_list_name = f"Colored List {datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        success = reminders.create_list(colored_list_name, color="#FF0000")  # Red
+        assert success, "Failed to create colored reminder list"
+        
+        # Refresh lists
+        reminders.refresh()
+        
+        # Verify the colored list was created
+        lists = reminders.lists
+        assert len(lists) == initial_count + 2, "List count did not increase for colored list"
+        assert colored_list_name in lists, f"Could not find newly created colored list: {colored_list_name}"
+        
+        # Test creating a list with invalid data
+        assert not reminders.create_list(""), "Should not create list with empty name"
+        assert not reminders.create_list(None), "Should not create list with None name"
+        assert not reminders.create_list("Test List", color="invalid"), "Should not create list with invalid color"
+        
+    except Exception as e:
+        pytest.fail(f"Failed during list creation test: {str(e)}")
