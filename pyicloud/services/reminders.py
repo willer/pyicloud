@@ -177,24 +177,9 @@ class EventKitRemindersService:
         return result
 
     def post(self, title: str, description: str = "", collection: Optional[str] = None,
-             priority: int = 0, tags: List[str] = None,
-             due_date: Optional[datetime] = None) -> Optional[str]:
-        """Create a new reminder.
-        
-        Args:
-            title: Title of the reminder
-            description: Optional description
-            collection: Optional collection name (defaults to first available)
-            priority: Optional priority level (0-4)
-            tags: Optional list of tags
-            due_date: Optional due date
-            
-        Returns:
-            str: GUID of created reminder if successful
-            
-        Raises:
-            PyiCloudException: If creation fails for any reason
-        """
+             priority: int = Priority.NONE, tags: List[str] = None,
+             due_date: Optional[datetime] = None, **kwargs) -> Optional[str]:
+        """Create a new reminder."""
         try:
             # Validate and format due date if provided
             if due_date is not None:
@@ -209,7 +194,7 @@ class EventKitRemindersService:
             calendar = self._calendar_for_name(collection)
             if not calendar:
                 raise PyiCloudException(f"Calendar not found: {collection}")
-
+            
             # Create the reminder
             reminder = EKReminder.reminderWithEventStore_(self.store)
             reminder.setTitle_(title)
@@ -504,44 +489,22 @@ class RemindersService:
         return self._impl.refresh(force)
 
     def post(self, title: str, description: str = "", collection: Optional[str] = None,
-             priority: int = 0, tags: List[str] = None,
-             due_date: Optional[datetime] = None) -> Optional[str]:
-        """Create a new reminder.
-        
-        Args:
-            title: Title of the reminder
-            description: Optional description
-            collection: Optional collection name (defaults to first available)
-            priority: Optional priority level (0-4)
-            tags: Optional list of tags
-            due_date: Optional due date
-            
-        Returns:
-            str: GUID of created reminder if successful
-            
-        Raises:
-            PyiCloudException: If creation fails for any reason
-        """
+             priority: int = Priority.NONE, tags: List[str] = None,
+             due_date: Optional[datetime] = None, **kwargs) -> Optional[str]:
+        """Create a new reminder with enhanced features."""
         try:
-            # Validate and format due date if provided
-            if due_date is not None:
-                if not isinstance(due_date, datetime):
-                    raise PyiCloudException("due_date must be a datetime object")
-                if due_date.tzinfo is None:
-                    # Localize naive datetime to UTC
-                    due_date = pytz.UTC.localize(due_date)
-
-            # Validate collection
-            collection = self._validate_collection(collection)
-
-            # Create the reminder using implementation
-            guid = self._impl.post(title, description, collection, priority, tags, due_date)
-            if guid is None:
-                raise PyiCloudException("Failed to create reminder - no GUID returned")
-            return guid
-
+            # Delegate to implementation instead of handling directly
+            return self._impl.post(
+                title=title,
+                description=description,
+                collection=collection,
+                priority=priority,
+                tags=tags,
+                due_date=due_date,
+                **kwargs
+            )
         except Exception as e:
-            LOGGER.error("Failed to create reminder: %s", str(e))
+            LOGGER.error(f"Failed to create reminder: {str(e)}")
             raise PyiCloudException(f"Failed to create reminder: {str(e)}")
 
     def get_reminder(self, guid: str) -> Optional[Dict]:
@@ -880,9 +843,9 @@ class RemindersService:
             utc_date.second
         ]
 
-    def create_list(self, name: str, color: Optional[str] = None) -> bool:
+    def create_list(self, name, color=None):
         """Create a new reminder list.
-        
+
         Args:
             name: The name of the list to create
             color: Optional color for the list (hex code or name)
@@ -896,12 +859,15 @@ class RemindersService:
                 return False
 
             # Format the request data according to iCloud API requirements
+            # Remove # from color code if present
+            formatted_color = color if color else "FF9500"
+            if formatted_color.startswith("#"):
+                formatted_color = formatted_color[1:]
+
             list_data = {
                 "Collection": {
                     "title": name,
-                    "type": "com.apple.reminders.list",
-                    "color": color if color else "#FF9500",  # Default orange color if none specified
-                    "createdDate": int(time.time() * 1000),  # Current time in milliseconds
+                    "color": formatted_color,
                     "enabled": True
                 }
             }
