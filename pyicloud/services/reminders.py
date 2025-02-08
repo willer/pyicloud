@@ -17,7 +17,7 @@ if sys.platform == 'darwin':
         NSDate, NSDateComponents, NSCalendar,
         NSCalendarUnitYear, NSCalendarUnitMonth, NSCalendarUnitDay,
         NSCalendarUnitHour, NSCalendarUnitMinute, NSCalendarUnitSecond,
-        NSError
+        NSError, NSTimeZone
     )
     from EventKit import (
         EKEventStore, EKReminder, EKCalendar,
@@ -38,6 +38,40 @@ class WebRemindersService:
     def refresh(self, force=False):
         """Refresh from iCloud."""
         return True
+
+    def update(self, guid: str, title: Optional[str] = None,
+               description: Optional[str] = None, due_date: Optional[datetime] = None,
+               collection: Optional[str] = None, priority: Optional[int] = None,
+               completed_date: Optional[datetime] = None) -> bool:
+        """Update a reminder."""
+        try:
+            # Format the request data
+            update_data = {}
+            if title is not None:
+                update_data["title"] = title
+            if description is not None:
+                update_data["notes"] = description
+            if priority is not None:
+                update_data["priority"] = priority
+            if collection is not None:
+                update_data["collection"] = collection
+            if due_date is not None:
+                update_data["dueDate"] = due_date.isoformat()
+            if completed_date is not None:
+                update_data["completedDate"] = completed_date.isoformat() if completed_date else None
+
+            # Make the request
+            response = self._make_request(
+                "PUT",
+                f"/rd/reminders/{guid}",
+                data=update_data
+            )
+
+            return response is not None and response.get("status", 0) == 0
+
+        except Exception as e:
+            LOGGER.error(f"Failed to update reminder: {str(e)}")
+            return False
 
 # Constants for performance tuning
 AUTH_TOKEN_EXPIRY = 3600  # 1 hour
@@ -166,13 +200,16 @@ class EventKitRemindersService:
         }
 
         if reminder.dueDateComponents():
-            components = reminder.dueDateComponents()
-            date = NSCalendar.currentCalendar().dateFromComponents_(components)
-            if date:
-                # Convert timestamp to datetime in UTC
-                dt = datetime.utcfromtimestamp(date.timeIntervalSince1970())
-                # Ensure timezone is set to UTC
-                result['due'] = pytz.UTC.localize(dt)
+            try:
+                # Get the date directly from NSDate
+                date = reminder.dueDate()
+                if date:
+                    # Convert timestamp to datetime in UTC
+                    dt = datetime.utcfromtimestamp(date.timeIntervalSince1970())
+                    # Ensure timezone is set to UTC
+                    result['due'] = pytz.UTC.localize(dt)
+            except Exception as e:
+                LOGGER.warning(f"Failed to convert due date: {str(e)}")
 
         return result
 
@@ -212,6 +249,7 @@ class EventKitRemindersService:
                 components.setHour_(due_date.hour)
                 components.setMinute_(due_date.minute)
                 components.setSecond_(due_date.second)
+                components.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
                 reminder.setDueDateComponents_(components)
 
             # Save the reminder
@@ -225,55 +263,6 @@ class EventKitRemindersService:
         except Exception as e:
             LOGGER.error("Failed to create reminder: %s", str(e))
             raise PyiCloudException(f"Failed to create reminder: {str(e)}")
-
-    def update(self, guid: str, title: Optional[str] = None,
-               description: Optional[str] = None, due_date: Optional[datetime] = None,
-               collection: Optional[str] = None, priority: Optional[int] = None) -> bool:
-        """Update a reminder."""
-        reminder = self.store.calendarItemWithIdentifier_(guid)
-        if not reminder:
-            return False
-
-        try:
-            if title is not None:
-                reminder.setTitle_(title)
-            if description is not None:
-                reminder.setNotes_(description)
-            if priority is not None:
-                reminder.setPriority_(priority)
-
-            if collection:
-                calendar = self._calendar_for_name(collection)
-                if calendar:
-                    reminder.setCalendar_(calendar)
-
-            if due_date:
-                if not isinstance(due_date, datetime):
-                    raise PyiCloudException("due_date must be a datetime object")
-                if due_date.tzinfo is None:
-                    # Localize naive datetime to UTC
-                    due_date = pytz.UTC.localize(due_date)
-                else:
-                    # Convert to UTC if in another timezone
-                    due_date = due_date.astimezone(pytz.UTC)
-
-                components = NSDateComponents.alloc().init()
-                components.setYear_(due_date.year)
-                components.setMonth_(due_date.month)
-                components.setDay_(due_date.day)
-                components.setHour_(due_date.hour)
-                components.setMinute_(due_date.minute)
-                components.setSecond_(due_date.second)
-                reminder.setDueDateComponents_(components)
-
-            success, error = self.store.saveReminder_commit_error_(reminder, True, None)
-            if not success:
-                LOGGER.error(f"Failed to update reminder: {error}")
-            return success
-
-        except Exception as e:
-            LOGGER.error(f"Failed to update reminder: {str(e)}")
-            return False
 
     def complete(self, guid: str) -> bool:
         """Mark a reminder as completed."""
@@ -463,6 +452,71 @@ class EventKitRemindersService:
         )
         return self._calendars[0].title()
 
+    def update(self, guid: str, title: Optional[str] = None,
+               description: Optional[str] = None, due_date: Optional[datetime] = None,
+               collection: Optional[str] = None, priority: Optional[int] = None,
+               completed_date: Optional[datetime] = None) -> bool:
+        """Update a reminder."""
+        reminder = self.store.calendarItemWithIdentifier_(guid)
+        if not reminder:
+            return False
+
+        try:
+            if title is not None:
+                reminder.setTitle_(title)
+            if description is not None:
+                reminder.setNotes_(description)
+            if priority is not None:
+                reminder.setPriority_(priority)
+
+            if collection:
+                calendar = self._calendar_for_name(collection)
+                if calendar:
+                    reminder.setCalendar_(calendar)
+
+            if due_date:
+                if not isinstance(due_date, datetime):
+                    raise PyiCloudException("due_date must be a datetime object")
+                if due_date.tzinfo is None:
+                    # Localize naive datetime to UTC
+                    due_date = pytz.UTC.localize(due_date)
+                else:
+                    # Convert to UTC if in another timezone
+                    due_date = due_date.astimezone(pytz.UTC)
+
+                components = NSDateComponents.alloc().init()
+                components.setYear_(due_date.year)
+                components.setMonth_(due_date.month)
+                components.setDay_(due_date.day)
+                components.setHour_(due_date.hour)
+                components.setMinute_(due_date.minute)
+                components.setSecond_(due_date.second)
+                components.setTimeZone_(NSTimeZone.timeZoneWithName_("UTC"))
+                reminder.setDueDateComponents_(components)
+
+            if completed_date is not None:
+                if completed_date:
+                    if not isinstance(completed_date, datetime):
+                        raise PyiCloudException("completed_date must be a datetime object")
+                    if completed_date.tzinfo is None:
+                        completed_date = pytz.UTC.localize(completed_date)
+                    else:
+                        completed_date = completed_date.astimezone(pytz.UTC)
+                    # Convert to NSDate
+                    ns_date = NSDate.dateWithTimeIntervalSince1970_(completed_date.timestamp())
+                    reminder.setCompletionDate_(ns_date)
+                else:
+                    reminder.setCompletionDate_(None)
+
+            success, error = self.store.saveReminder_commit_error_(reminder, True, None)
+            if not success:
+                LOGGER.error(f"Failed to update reminder: {error}")
+            return success
+
+        except Exception as e:
+            LOGGER.error(f"Failed to update reminder: {str(e)}")
+            return False
+
 class RemindersService:
     """The 'Reminders' iCloud service."""
 
@@ -513,9 +567,18 @@ class RemindersService:
 
     def update(self, guid: str, title: Optional[str] = None,
                description: Optional[str] = None, due_date: Optional[datetime] = None,
-               collection: Optional[str] = None, priority: Optional[int] = None) -> bool:
+               collection: Optional[str] = None, priority: Optional[int] = None,
+               completed_date: Optional[datetime] = None) -> bool:
         """Update a reminder."""
-        return self._impl.update(guid, title, description, due_date, collection, priority)
+        return self._impl.update(
+            guid=guid,
+            title=title,
+            description=description,
+            due_date=due_date,
+            collection=collection,
+            priority=priority,
+            completed_date=completed_date
+        )
 
     def complete(self, guid: str) -> bool:
         """Mark a reminder as completed."""
@@ -864,11 +927,16 @@ class RemindersService:
             if formatted_color.startswith("#"):
                 formatted_color = formatted_color[1:]
 
+            # Get current time in correct format
+            now = datetime.utcnow()
+            timestamp_z = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'  # Truncate microseconds to 3 digits
+
             list_data = {
                 "Collection": {
                     "title": name,
                     "color": formatted_color,
-                    "enabled": True
+                    "enabled": True,
+                    "type": "com.apple.reminders.collection"
                 }
             }
 
